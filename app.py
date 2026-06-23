@@ -426,7 +426,34 @@ def inject_css() -> None:
             font-family:'Prompt','Inter',sans-serif;
             color:var(--kc-ink); letter-spacing:-.01em;
         }
-        .block-container{ padding-top:1.4rem; padding-bottom:3rem; max-width:1160px; }
+        /* ---- Responsive content width (sidebar-toggle fix) ----
+           Fluid + ALWAYS centered, whether the sidebar is open or collapsed.
+           1) Zero the collapsed sidebar so it stops reserving ~340px on the
+              left (the root cause of the "pushed right / gap on left" bug).
+           2) Let the main area span the full available width.
+           3) A generous cap + forced auto side-margins keep content centered
+              and let it breathe instead of being locked to a narrow column. */
+        section[data-testid="stSidebar"][aria-expanded="false"]{
+            width:0 !important; min-width:0 !important; margin-left:0 !important;
+        }
+        [data-testid="stMain"]{ width:100% !important; }
+        /* Keep Streamlit's fixed top strip (where the >> toggle lives) on the
+           Kori Frost canvas colour and above the content, so nothing can ever
+           show through behind the toggle button. */
+        [data-testid="stHeader"]{
+            background:var(--kc-bg) !important;
+            height:3.5rem !important; z-index:1000;
+        }
+        .block-container, [data-testid="stMainBlockContainer"]{
+            max-width:1500px !important;
+            margin-left:auto !important; margin-right:auto !important;
+            /* Fixed, generous top padding ALWAYS clears the header — no overlap
+               with the >> button whether the sidebar is open or collapsed.
+               No negative margins / absolute positioning anywhere. */
+            padding-top:4.5rem !important; padding-bottom:3rem !important;
+            padding-left:clamp(1rem,4vw,3rem) !important;
+            padding-right:clamp(1rem,4vw,3rem) !important;
+        }
         #MainMenu, footer{ visibility:hidden; }
 
         /* ---- Minimalist top bar (no gradient) ---- */
@@ -516,7 +543,6 @@ def inject_css() -> None:
 
         /* ---- Mobile ---- */
         @media (max-width:640px){
-            .block-container{ padding-left:.7rem; padding-right:.7rem; }
             .kc-topbar .clock{ display:none; }
             .kc-pill{ margin-left:0; }
         }
