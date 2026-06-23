@@ -1,7 +1,8 @@
 """
-Koricube Internal Operations Console
-====================================
-A Streamlit front-end for the "Koricube" automated ice-machine business.
+Koricube Internal Operations Console — "Kori Frost" Edition
+===========================================================
+A Streamlit front-end for the "Koricube" automated ice-machine business,
+styled as a clean, minimalist, crisp SaaS dashboard (Stripe / Vercel feel).
 
 The single source of truth is a Google Sheets workbook named ``Koricube_Database``
 containing four worksheets:
@@ -11,14 +12,22 @@ containing four worksheets:
     - Raw_Email     (parsed bank settlement rows)                       [APPEND]
     - Maintenance   (repair tickets)                                    [APPEND]
 
-CRITICAL ARCHITECTURE RULES
----------------------------
+CRITICAL ARCHITECTURE RULES (UNBREAKABLE)
+-----------------------------------------
 1. Row 1 of every *write* sheet holds live ArrayFormula / MAP+LAMBDA logic.
    We therefore NEVER touch row 1 and exclusively use ``worksheet.append_row()``
    which writes to the first fully-empty row at the bottom of the sheet.
 2. Every date pushed to Google Sheets is normalised to a strict ``YYYY-MM-DD``
    string so the upstream formulas never misparse a locale-specific date.
 3. All timestamps/dates are generated in the ``Asia/Bangkok`` timezone.
+
+Theming note
+------------
+The base palette (ice-blue primary, off-white canvas, slate text) lives in
+``.streamlit/config.toml`` so native widgets — sidebar, selects, number-input
+steppers — keep their correct light styling. The CSS below ONLY layers
+typography + card/badge surfaces on top; it deliberately does not restyle
+inputs, steppers, or the sidebar.
 
 Author: Koricube Engineering
 """
@@ -27,7 +36,8 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, date
-from typing import Any, Dict, List, Optional
+from html import escape
+from typing import Any, List, Optional
 
 import pandas as pd
 import streamlit as st
@@ -379,58 +389,280 @@ def _parse_settlement_cells(cells: List[str]) -> Optional[List[Any]]:
 
 
 # ===========================================================================
+# PRESENTATION LAYER — "Kori Frost" CSS / HTML COMPONENTS (cosmetic only)
+# ===========================================================================
+def inject_css() -> None:
+    """
+    Layer the Kori Frost surfaces on top of the config.toml base theme.
+
+    Scope is intentionally narrow:
+      - typography (Prompt / Inter)
+      - the minimalist top bar (NO gradient)
+      - section headings, the compact status badge, the reconciliation cue
+      - soft Kori shadow on cards (forms + bordered containers)
+      - a light hover polish on PRIMARY buttons only
+
+    It deliberately does NOT target inputs, number steppers, selects, or the
+    sidebar, so Streamlit's native light theme renders them untouched.
+    """
+    st.markdown(
+        """
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Prompt:wght@400;500;600&display=swap');
+
+        :root{
+            --kc-bg:#F8FAFC; --kc-card:#FFFFFF; --kc-border:#E2E8F0;
+            --kc-ink:#0F172A; --kc-muted:#64748B;
+            --kc-accent:#0EA5E9; --kc-accent-strong:#0284C7;
+            --kc-accent-soft:#E0F2FE; --kc-accent-line:#BAE6FD;
+            --kc-shadow:0 4px 6px -1px rgba(0,0,0,.05);
+            --kc-radius:14px;
+        }
+
+        html, body, [class*="css"], p, span, label, div, button{
+            font-family:'Inter','Prompt',system-ui,sans-serif;
+        }
+        h1,h2,h3,h4{
+            font-family:'Prompt','Inter',sans-serif;
+            color:var(--kc-ink); letter-spacing:-.01em;
+        }
+        .block-container{ padding-top:1.4rem; padding-bottom:3rem; max-width:1160px; }
+        #MainMenu, footer{ visibility:hidden; }
+
+        /* ---- Minimalist top bar (no gradient) ---- */
+        .kc-topbar{ display:flex; align-items:center; gap:14px; margin:2px 0 20px; }
+        .kc-logo{
+            width:44px; height:44px; border-radius:12px; display:grid; place-items:center;
+            background:var(--kc-accent-soft); color:var(--kc-accent-strong);
+            font-size:1.4rem; border:1px solid var(--kc-accent-line);
+        }
+        .kc-topbar .t{ font-family:'Prompt',sans-serif; font-weight:600; font-size:1.3rem; color:var(--kc-ink); line-height:1.15; }
+        .kc-topbar .s{ color:var(--kc-muted); font-size:.84rem; margin-top:2px; }
+        .kc-topbar .clock{
+            margin-left:auto; font-size:.8rem; color:var(--kc-muted);
+            background:var(--kc-card); border:1px solid var(--kc-border);
+            border-radius:999px; padding:6px 14px; box-shadow:var(--kc-shadow); white-space:nowrap;
+        }
+
+        /* ---- Section heading ---- */
+        .kc-sec{ display:flex; align-items:center; gap:11px; margin:2px 0 12px; }
+        .kc-sec .i{
+            width:34px; height:34px; border-radius:9px; display:grid; place-items:center;
+            background:var(--kc-accent-soft); color:var(--kc-accent-strong);
+            font-size:1rem; border:1px solid var(--kc-accent-line);
+        }
+        .kc-sec .h{ font-family:'Prompt',sans-serif; font-weight:600; font-size:1.02rem; color:var(--kc-ink); }
+        .kc-sec .d{ font-size:.8rem; color:var(--kc-muted); margin-top:1px; }
+
+        /* ---- Compact single-line status badge row ---- */
+        .kc-status{
+            display:flex; flex-wrap:wrap; align-items:center; gap:10px 22px;
+            background:var(--kc-card); border:1px solid var(--kc-border);
+            border-radius:var(--kc-radius); padding:12px 18px;
+            box-shadow:var(--kc-shadow); margin-bottom:6px;
+        }
+        .kc-status .it{ display:flex; align-items:baseline; gap:7px; }
+        .kc-status .it .k{ font-size:.68rem; text-transform:uppercase; letter-spacing:.05em; color:var(--kc-muted); font-weight:600; }
+        .kc-status .it .v{ font-size:.92rem; font-weight:600; color:var(--kc-ink); }
+        .kc-status .sep{ width:1px; height:18px; background:var(--kc-border); }
+        .kc-pill{
+            display:inline-flex; align-items:center; gap:6px; margin-left:auto;
+            padding:5px 12px; border-radius:999px; font-size:.82rem; font-weight:600;
+        }
+        .kc-pill.transfer{ background:var(--kc-accent-soft); color:var(--kc-accent-strong); border:1px solid var(--kc-accent-line); }
+        .kc-pill.cash{ background:#F1F5F9; color:#475569; border:1px solid var(--kc-border); }
+
+        /* ---- Reconciliation cue (subtle, crisp) ---- */
+        .kc-rec{
+            display:flex; align-items:center; justify-content:space-between; gap:10px;
+            padding:10px 16px; border-radius:12px; font-weight:600;
+            margin-top:2px; border:1px solid var(--kc-border); background:var(--kc-card);
+        }
+        .kc-rec .lbl{ font-size:.8rem; font-weight:600; color:var(--kc-muted); }
+        .kc-rec .val{ font-size:1rem; font-weight:700; }
+        .kc-rec.ok{    background:#F0FDF4; border-color:#BBF7D0; } .kc-rec.ok .val{    color:#15803D; }
+        .kc-rec.over{  background:#FFF7ED; border-color:#FED7AA; } .kc-rec.over .val{  color:#C2410C; }
+        .kc-rec.short{ background:#FEF2F2; border-color:#FECACA; } .kc-rec.short .val{ color:#B91C1C; }
+
+        /* ---- Cards: forms + bordered containers get the soft Kori shadow ---- */
+        [data-testid="stForm"]{
+            background:var(--kc-card); border:1px solid var(--kc-border);
+            border-radius:16px; padding:18px 20px; box-shadow:var(--kc-shadow);
+        }
+        [data-testid="stVerticalBlockBorderWrapper"]{
+            border-radius:16px; box-shadow:var(--kc-shadow);
+        }
+
+        /* ---- PRIMARY buttons only: tiny polish (colour comes from config) ----
+           NOTE: number steppers / inputs / selects / sidebar are NOT touched. */
+        .stButton>button[kind="primary"],
+        .stFormSubmitButton>button[kind="primaryFormSubmit"],
+        .stFormSubmitButton>button[kind="primary"]{
+            border-radius:10px; font-weight:600;
+            transition:transform .15s ease, box-shadow .2s ease, filter .2s ease;
+        }
+        .stButton>button[kind="primary"]:hover,
+        .stFormSubmitButton>button[kind="primaryFormSubmit"]:hover,
+        .stFormSubmitButton>button[kind="primary"]:hover{
+            transform:translateY(-1px);
+            box-shadow:0 6px 14px -4px rgba(2,132,199,.45);
+            filter:brightness(1.03);
+        }
+
+        /* ---- Tabs: minimal, ice-blue active ---- */
+        .stTabs [data-baseweb="tab-list"]{ gap:4px; border-bottom:1px solid var(--kc-border); }
+        .stTabs [data-baseweb="tab"]{ font-weight:600; color:var(--kc-muted); }
+        .stTabs [aria-selected="true"]{ color:var(--kc-accent-strong); }
+
+        /* ---- Mobile ---- */
+        @media (max-width:640px){
+            .block-container{ padding-left:.7rem; padding-right:.7rem; }
+            .kc-topbar .clock{ display:none; }
+            .kc-pill{ margin-left:0; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_topbar() -> None:
+    """Clean, minimalist header (no gradient) with a live Bangkok clock."""
+    clock = now_bkk().strftime("%d %b %Y · %H:%M")
+    st.markdown(
+        f"""
+        <div class="kc-topbar">
+            <div class="kc-logo">🧊</div>
+            <div>
+                <div class="t">Koricube Operations Console</div>
+                <div class="s">Kori Frost · ระบบจัดการตู้น้ำแข็งอัตโนมัติ</div>
+            </div>
+            <div class="clock">🕒 Asia/Bangkok · {escape(clock)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def section_header(icon: str, title: str, subtitle: str) -> None:
+    """Reusable minimalist section heading (small icon chip + title)."""
+    st.markdown(
+        f"""
+        <div class="kc-sec">
+            <div class="i">{icon}</div>
+            <div>
+                <div class="h">{escape(title)}</div>
+                <div class="d">{escape(subtitle)}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_status_card(machine: pd.Series, payment_type: str, is_cash_only: bool) -> None:
+    """Compact, single-line status badge: ID · Branch · Merchant · Payment pill."""
+    pay_class = "cash" if is_cash_only else "transfer"
+    pay_icon = "💵" if is_cash_only else "🔄"
+    st.markdown(
+        f"""
+        <div class="kc-status">
+            <div class="it"><span class="k">Machine</span>
+                <span class="v">{escape(machine[LOC_MACHINE_ID])}</span></div>
+            <div class="sep"></div>
+            <div class="it"><span class="k">Branch</span>
+                <span class="v">{escape(machine[LOC_BRANCH] or '—')}</span></div>
+            <div class="sep"></div>
+            <div class="it"><span class="k">Merchant</span>
+                <span class="v">{escape(machine[LOC_MERCHANT_NO] or '—')}</span></div>
+            <div class="kc-pill {pay_class}">{pay_icon} {escape(payment_type or '—')}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_reconciliation_cue(web_total: float, cash_collected: float) -> None:
+    """Live colour-coded delta between cash counted and web telemetry total."""
+    diff = round(cash_collected - web_total, 2)
+    if abs(diff) < 0.01:
+        cls, label, val = "ok", "✅ ตรงกัน (Matched)", "0.00"
+    elif diff > 0:
+        cls, label, val = "over", "🔺 เงินเกิน (Over)", f"+{diff:,.2f}"
+    else:
+        cls, label, val = "short", "🔻 เงินขาด (Short)", f"{diff:,.2f}"
+    st.markdown(
+        f"""
+        <div class="kc-rec {cls}">
+            <span class="lbl">Reconciliation · Cash − Web</span>
+            <span class="val">{label} &nbsp; ฿{val}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def machine_label(row: pd.Series) -> str:
+    """Dropdown label: 'Branch - Machine_Type (Machine_ID)' (ID keeps it unique)."""
+    return f"{row[LOC_BRANCH]} - {row[LOC_MACHINE_TYPE]} ({row[LOC_MACHINE_ID]})"
+
+
+# ===========================================================================
 # UI — FEATURE 1: SALES LOG  (กระทบยอดเงินสด)
 # ===========================================================================
 def render_sales_log(location_df: pd.DataFrame) -> None:
-    st.subheader("📋 Sales Log — กระทบยอดเงินสด")
+    section_header("📋", "Sales Log — กระทบยอดเงินสด",
+                   "Daily cash reconciliation against web telemetry")
 
     if location_df.empty:
         st.warning("No machines found in the Location master sheet.")
         return
 
-    # Build the dropdown label: "Branch - Machine_Type (Machine_ID)".
-    # Machine_ID is appended to keep labels unique when branch+type collide.
-    def make_label(row: pd.Series) -> str:
-        return f"{row[LOC_BRANCH]} - {row[LOC_MACHINE_TYPE]} ({row[LOC_MACHINE_ID]})"
-
-    labels = location_df.apply(make_label, axis=1).tolist()
+    labels = location_df.apply(machine_label, axis=1).tolist()
     label_to_index = {label: idx for idx, label in enumerate(labels)}
 
-    # Selectbox lives OUTSIDE st.form so the UI can react (show/hide period
-    # fields) the instant a machine with a different Payment_Type is chosen.
+    # Selectbox stays OUTSIDE a form: selecting a machine reruns instantly so the
+    # period fields and the live reconciliation cue can react in real time.
     selected_label = st.selectbox("Select Machine (เลือกตู้)", labels)
     machine = location_df.iloc[label_to_index[selected_label]]
 
     payment_type = machine[LOC_PAYMENT_TYPE]
     is_cash_only = payment_type == PAYMENT_CASH_ONLY
 
-    # Surface the live master-data values that will be stamped on submit.
-    info_cols = st.columns(4)
-    info_cols[0].metric("Machine ID", machine[LOC_MACHINE_ID])
-    info_cols[1].metric("Branch", machine[LOC_BRANCH])
-    info_cols[2].metric("Merchant No", machine[LOC_MERCHANT_NO] or "—")
-    info_cols[3].metric("Payment Type", payment_type or "—")
+    # Compact, single-line status badge (replaces bulky headings).
+    render_status_card(machine, payment_type, is_cash_only)
 
-    with st.form("sales_log_form", clear_on_submit=True):
-        # Period fields only make sense for transfer + cash machines.
+    # All inputs grouped inside one clean white card.
+    with st.container(border=True):
+        # CRITICAL: period inputs only appear for 'โอน+เงินสด' machines.
         period_start_obj: Optional[date] = None
         period_end_obj: Optional[date] = None
         if not is_cash_only:
-            st.caption("Reconciliation period (โอน+เงินสด)")
+            st.markdown("**🗓️ Reconciliation period · ช่วงรอบบิล**")
             p1, p2 = st.columns(2)
-            period_start_obj = p1.date_input("Period Start", value=None)
-            period_end_obj = p2.date_input("Period End", value=None)
+            period_start_obj = p1.date_input("Period Start", value=None, key="sl_pstart")
+            period_end_obj = p2.date_input("Period End", value=None, key="sl_pend")
 
-        c1, c2 = st.columns(2)
-        web_total = c1.number_input(
-            "Web Total (ยอดเว็บ)", min_value=0.0, step=1.0, format="%.2f"
+        # CRITICAL: Web Total is available for EVERY machine (telemetry audit).
+        st.markdown("**💰 Amounts · ยอดเงิน**")
+        m1, m2 = st.columns(2)
+        web_total = m1.number_input(
+            "Web Total · ยอดเว็บ (฿)", min_value=0.0, step=1.0, format="%.2f", key="sl_web"
         )
-        cash_collected = c2.number_input(
-            "Cash Collected (เงินสดที่เก็บได้)", min_value=0.0, step=1.0, format="%.2f"
+        cash_collected = m2.number_input(
+            "Cash Collected · เงินสดที่เก็บได้ (฿)",
+            min_value=0.0, step=1.0, format="%.2f", key="sl_cash",
         )
-        remark = st.text_area("Remark (หมายเหตุ)", placeholder="Optional notes…")
 
-        submitted = st.form_submit_button("Submit Sales Log", type="primary")
+        # Live, colour-coded reconciliation feedback.
+        render_reconciliation_cue(web_total, cash_collected)
+
+        remark = st.text_area(
+            "Remark · หมายเหตุ", placeholder="Optional notes…", key="sl_remark"
+        )
+
+        submitted = st.button("Submit Sales Log", type="primary",
+                              use_container_width=True, key="sl_submit")
 
     if not submitted:
         return
@@ -453,17 +685,17 @@ def render_sales_log(location_df: pd.DataFrame) -> None:
 
     # Payload order is contractually fixed — do not reorder.
     payload = [
-        today_iso(),            # Collection_Date
+        today_iso(),              # Collection_Date
         machine[LOC_MACHINE_ID],  # Machine_ID
-        branch_name,            # Branch_Name
-        merchant_no,            # Merchant_No
-        payment_type,           # Payment_Type
-        machines_shared,        # Machines_Shared
-        float(web_total),       # Web_Total
-        float(cash_collected),  # Cash_Collected
-        period_start,           # Period_Start
-        period_end,             # Period_End
-        remark.strip(),         # Remark
+        branch_name,              # Branch_Name
+        merchant_no,              # Merchant_No
+        payment_type,             # Payment_Type
+        machines_shared,          # Machines_Shared
+        float(web_total),         # Web_Total
+        float(cash_collected),    # Cash_Collected
+        period_start,             # Period_Start
+        period_end,               # Period_End
+        remark.strip(),           # Remark
     ]
 
     try:
@@ -480,14 +712,16 @@ def render_sales_log(location_df: pd.DataFrame) -> None:
 # UI — FEATURE 2: BANK STATEMENT PROCESSOR  (อ่าน PDF ด้วย pdfplumber)
 # ===========================================================================
 def render_pdf_processor() -> None:
-    st.subheader("🏦 Bank Statement Processor — อ่าน PDF ด้วย pdfplumber")
+    section_header("🏦", "Bank Statement Processor — อ่าน PDF ด้วย pdfplumber",
+                   "Extract settlement rows · auto-convert Buddhist Era → AD")
 
     if not _PDFPLUMBER_AVAILABLE:
         st.error("pdfplumber is not available in this environment.")
         return
 
     uploaded = st.file_uploader(
-        "Upload bank settlement report (PDF)", type=["pdf"], accept_multiple_files=False
+        "Upload bank settlement report (PDF)", type=["pdf"],
+        accept_multiple_files=False,
     )
     if uploaded is None:
         st.info("Upload a settlement PDF to begin extraction.")
@@ -509,7 +743,8 @@ def render_pdf_processor() -> None:
         df, num_rows="dynamic", use_container_width=True, key="pdf_editor"
     )
 
-    if st.button("Append all rows to Raw_Email", type="primary"):
+    if st.button("Append all rows to Raw_Email", type="primary",
+                 use_container_width=True):
         success, failed = 0, 0
         for _, row in edited.iterrows():
             payload = [
@@ -536,26 +771,27 @@ def render_pdf_processor() -> None:
 # UI — FEATURE 3: MAINTENANCE FORM  (แจ้งซ่อม)
 # ===========================================================================
 def render_maintenance(location_df: pd.DataFrame) -> None:
-    st.subheader("🔧 Maintenance — แจ้งซ่อม")
+    section_header("🔧", "Maintenance — แจ้งซ่อม",
+                   "Log a repair ticket · default status รอซ่อม")
 
     if location_df.empty:
         st.warning("No machines found in the Location master sheet.")
         return
 
-    def make_label(row: pd.Series) -> str:
-        return f"{row[LOC_BRANCH]} - {row[LOC_MACHINE_TYPE]} ({row[LOC_MACHINE_ID]})"
-
-    labels = location_df.apply(make_label, axis=1).tolist()
+    labels = location_df.apply(machine_label, axis=1).tolist()
     label_to_index = {label: idx for idx, label in enumerate(labels)}
 
     with st.form("maintenance_form", clear_on_submit=True):
-        selected_label = st.selectbox("Select Machine (เลือกตู้)", labels)
-        error_code = st.selectbox("Error Code", ERROR_CODES)
+        top1, top2 = st.columns([2, 1])
+        selected_label = top1.selectbox("Select Machine (เลือกตู้)", labels)
+        error_code = top2.selectbox("Error Code", ERROR_CODES)
         issue_desc = st.text_area("Issue Description (รายละเอียดปัญหา)")
         repair_cost = st.number_input(
-            "Repair Cost (ค่าซ่อม)", min_value=0.0, step=1.0, format="%.2f"
+            "Repair Cost · ค่าซ่อม (฿)", min_value=0.0, step=1.0, format="%.2f"
         )
-        submitted = st.form_submit_button("Submit Repair Ticket", type="primary")
+        submitted = st.form_submit_button(
+            "Submit Repair Ticket", type="primary", use_container_width=True
+        )
 
     if not submitted:
         return
@@ -592,25 +828,26 @@ def main() -> None:
     st.set_page_config(
         page_title="Koricube Console", page_icon="🧊", layout="wide"
     )
-    st.title("🧊 Koricube Operations Console")
-    st.caption(
-        f"Bangkok time: {now_bkk().strftime('%Y-%m-%d %H:%M:%S')} • "
-        f"Database: {SPREADSHEET_NAME}"
-    )
+    inject_css()
+    render_topbar()
 
     # --- Sidebar: connection status + manual data refresh -------------------
     with st.sidebar:
-        st.header("Connection")
+        st.markdown("### ⚙️ Connection")
         try:
             get_spreadsheet()  # forces auth + open; cached afterwards
-            st.success("Connected to Koricube_Database")
+            st.success("Connected · Koricube_Database")
         except Exception as exc:  # noqa: BLE001
             st.error(f"Connection failed: {exc}")
             st.stop()
 
-        if st.button("🔄 Refresh master data"):
+        if st.button("🔄 Refresh master data", use_container_width=True):
             fetch_location_data.clear()
             st.rerun()
+
+        st.markdown("---")
+        st.caption("🔒 Row 1 protected · append-only writes")
+        st.caption("📅 Dates · YYYY-MM-DD · 🌏 Asia/Bangkok")
 
     # --- Load shared master data once --------------------------------------
     try:

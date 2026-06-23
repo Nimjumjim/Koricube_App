@@ -1,0 +1,14 @@
+# Kori Frost — base theme.
+# Driving the palette from here (instead of brute-force CSS) keeps native
+# widgets — sidebar, selects, and the number-input +/- steppers — correctly
+# light-themed. The app-level CSS only layers card/badge styling on top.
+[theme]
+base = "light"
+primaryColor = "#0EA5E9"            # Ice blue accent (buttons, highlights)
+backgroundColor = "#F8FAFC"         # Crisp cool off-white canvas
+secondaryBackgroundColor = "#FFFFFF" # Pure white cards / sidebar / inputs
+textColor = "#0F172A"               # Deep slate/navy text
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"
