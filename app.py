@@ -660,6 +660,14 @@ def render_sales_log(location_df: pd.DataFrame) -> None:
 
     # All inputs grouped inside one clean white card.
     with st.container(border=True):
+        # Manual collection date — defaults to today (Bangkok) but is fully
+        # back-datable, since coins are often counted at month-end yet entered a
+        # few days later. THIS chosen date is what lands in Column A.
+        collection_date_obj: date = st.date_input(
+            "Collection Date · วันที่เก็บยอด",
+            value=now_bkk().date(), key="sl_cdate",
+        )
+
         # CRITICAL: period inputs only appear for 'โอน+เงินสด' machines.
         period_start_obj: Optional[date] = None
         period_end_obj: Optional[date] = None
@@ -669,19 +677,27 @@ def render_sales_log(location_df: pd.DataFrame) -> None:
             period_start_obj = p1.date_input("Period Start", value=None, key="sl_pstart")
             period_end_obj = p2.date_input("Period End", value=None, key="sl_pend")
 
-        # CRITICAL: Web Total is available for EVERY machine (telemetry audit).
         st.markdown("**💰 Amounts · ยอดเงิน**")
-        m1, m2 = st.columns(2)
-        web_total = m1.number_input(
-            "Web Total · ยอดเว็บ (฿)", min_value=0.0, step=1.0, format="%.2f", key="sl_web"
-        )
-        cash_collected = m2.number_input(
-            "Cash Collected · เงินสดที่เก็บได้ (฿)",
-            min_value=0.0, step=1.0, format="%.2f", key="sl_cash",
-        )
-
-        # Live, colour-coded reconciliation feedback.
-        render_reconciliation_cue(web_total, cash_collected)
+        # Cash-only machines have NO IoT telemetry -> hide Web Total entirely
+        # (it would otherwise be a confusing, formula-breaking field).
+        if is_cash_only:
+            web_total = None  # nothing to capture; payload will send blank
+            cash_collected = st.number_input(
+                "Cash Collected · เงินสดที่เก็บได้ (฿)",
+                min_value=0.0, step=1.0, format="%.2f", key="sl_cash",
+            )
+        else:
+            m1, m2 = st.columns(2)
+            web_total = m1.number_input(
+                "Web Total · ยอดเว็บ (฿)",
+                min_value=0.0, step=1.0, format="%.2f", key="sl_web",
+            )
+            cash_collected = m2.number_input(
+                "Cash Collected · เงินสดที่เก็บได้ (฿)",
+                min_value=0.0, step=1.0, format="%.2f", key="sl_cash",
+            )
+            # Reconciliation only makes sense when web telemetry exists.
+            render_reconciliation_cue(web_total, cash_collected)
 
         remark = st.text_area(
             "Remark · หมายเหตุ", placeholder="Optional notes…", key="sl_remark"
@@ -701,6 +717,13 @@ def render_sales_log(location_df: pd.DataFrame) -> None:
     period_start = "" if is_cash_only else date_to_iso(period_start_obj)
     period_end = "" if is_cash_only else date_to_iso(period_end_obj)
 
+    # The manually chosen collection date drives Column A (strict YYYY-MM-DD,
+    # Bangkok). Fall back to today only if somehow blank.
+    collection_date = date_to_iso(collection_date_obj) or today_iso()
+
+    # Cash-only machines have no telemetry -> send a blank Web_Total.
+    web_total_value: Any = "" if is_cash_only else float(web_total)
+
     # Validate period inputs for transfer machines.
     if not is_cash_only and (not period_start or not period_end):
         st.error("Please provide both Period Start and Period End for this machine.")
@@ -711,13 +734,13 @@ def render_sales_log(location_df: pd.DataFrame) -> None:
 
     # Payload order is contractually fixed — do not reorder.
     payload = [
-        today_iso(),              # Collection_Date
+        collection_date,          # Collection_Date (manual, back-datable)
         machine[LOC_MACHINE_ID],  # Machine_ID
         branch_name,              # Branch_Name
         merchant_no,              # Merchant_No
         payment_type,             # Payment_Type
         machines_shared,          # Machines_Shared
-        float(web_total),         # Web_Total
+        web_total_value,          # Web_Total ("" for cash-only machines)
         float(cash_collected),    # Cash_Collected
         period_start,             # Period_Start
         period_end,               # Period_End
