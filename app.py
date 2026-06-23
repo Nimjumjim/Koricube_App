@@ -644,6 +644,21 @@ def render_sales_log(location_df: pd.DataFrame) -> None:
         st.warning("No machines found in the Location master sheet.")
         return
 
+    # --- Post-submit reset (runs BEFORE any widget is instantiated) ----------
+    # Mutating a widget-bound key after its widget exists is forbidden by
+    # Streamlit, so a successful save only flags a reset + reruns; here, at the
+    # top of that fresh run, we drop the keys so each widget rebuilds at its
+    # default (numbers -> 0.00, dates -> today/None, remark -> "").
+    if st.session_state.pop("sl_do_reset", False):
+        for _k in ("sl_cdate", "sl_pstart", "sl_pend", "sl_web", "sl_cash", "sl_remark"):
+            st.session_state.pop(_k, None)
+
+    # One-shot success flash carried over from the run that just saved + reset.
+    _flash = st.session_state.pop("sl_flash", None)
+    if _flash:
+        st.success(_flash["msg"])
+        st.caption(_flash["caption"])
+
     labels = location_df.apply(machine_label, axis=1).tolist()
     label_to_index = {label: idx for idx, label in enumerate(labels)}
 
@@ -753,8 +768,14 @@ def render_sales_log(location_df: pd.DataFrame) -> None:
         st.error(f"Failed to write to Sales_Log: {exc}")
         return
 
-    st.success(f"✅ Sales log saved for {machine[LOC_MACHINE_ID]} ({branch_name}).")
-    st.caption(f"Collection date stamped: {payload[0]}")
+    # Success: stash a one-shot flash, flag the input keys for reset, and rerun
+    # so the form comes back cleared (prevents accidental double-entries).
+    st.session_state["sl_flash"] = {
+        "msg": f"✅ Sales log saved for {machine[LOC_MACHINE_ID]} ({branch_name}).",
+        "caption": f"Collection date stamped: {collection_date}",
+    }
+    st.session_state["sl_do_reset"] = True
+    st.rerun()
 
 
 # ===========================================================================
