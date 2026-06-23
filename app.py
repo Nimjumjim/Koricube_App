@@ -645,13 +645,23 @@ def render_sales_log(location_df: pd.DataFrame) -> None:
         return
 
     # --- Post-submit reset (runs BEFORE any widget is instantiated) ----------
-    # Mutating a widget-bound key after its widget exists is forbidden by
-    # Streamlit, so a successful save only flags a reset + reruns; here, at the
-    # top of that fresh run, we drop the keys so each widget rebuilds at its
-    # default (numbers -> 0.00, dates -> today/None, remark -> "").
-    if st.session_state.pop("sl_do_reset", False):
-        for _k in ("sl_cdate", "sl_pstart", "sl_pend", "sl_web", "sl_cash", "sl_remark"):
-            st.session_state.pop(_k, None)
+    # NOTE: popping the keys is unreliable — Streamlit's frontend can re-attach
+    # the orphaned state, leaving a stale number/date in the field. The robust
+    # fix is to EXPLICITLY overwrite each key with its default value here, while
+    # we're still ahead of widget instantiation this run.
+    if st.session_state.get("sl_do_reset", False):
+        st.session_state["sl_cash"] = 0.00       # Cash Collected -> 0.00
+        st.session_state["sl_remark"] = ""        # Remark -> empty
+        st.session_state["sl_cdate"] = now_bkk().date()  # Collection Date -> today
+
+        if "sl_web" in st.session_state:          # Web Total -> 0.00 (if visible)
+            st.session_state["sl_web"] = 0.00
+        if "sl_pstart" in st.session_state:       # Period Start -> empty (if visible)
+            st.session_state["sl_pstart"] = None
+        if "sl_pend" in st.session_state:         # Period End -> empty (if visible)
+            st.session_state["sl_pend"] = None
+
+        st.session_state["sl_do_reset"] = False   # clear the flag
 
     # One-shot success flash carried over from the run that just saved + reset.
     _flash = st.session_state.pop("sl_flash", None)
