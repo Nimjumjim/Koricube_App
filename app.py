@@ -573,7 +573,7 @@ def aggregate_bank_transfers(
     within the inclusive range [start, end].
 
     Returns ``(X, Y)`` where:
-        X = SUM(Net_Transfer)   -> Actual Total Transfer
+        X = SUM(Trans_Amount)   -> GROSS Actual Total Transfer
         Y = SUM(Commission)     -> Total Bank Fee
     rounded to 2 dp. Returns ``None`` when the merchant/dates are missing, no
     rows fall in range, OR the transfer total X is 0 (treated as "not in yet").
@@ -604,7 +604,7 @@ def aggregate_bank_transfers(
     if match.empty:
         return None
 
-    x = round(float(match["Net_Transfer"].apply(_to_float).sum()), 2)
+    x = round(float(match["Trans_Amount"].apply(_to_float).sum()), 2)
     y = round(float(match["Commission"].apply(_to_float).sum()), 2)
     if x == 0:  # no real transfer landed in this window yet
         return None
@@ -1015,7 +1015,7 @@ def render_sales_log(location_df: pd.DataFrame) -> None:
         )
 
         # --- Auto-aggregate the bank transfer (X, Y) over the PERIOD ----------
-        # X = Σ Net_Transfer, Y = Σ Commission, summed across the merchant's
+        # X = Σ Trans_Amount (gross), Y = Σ Commission, summed across the merchant's
         # settlements in [Period_Start, Period_End]. No manual bank entry.
         collection_date = date_to_iso(collection_date_obj) or today_iso()
         period_start = "" if is_cash_only else date_to_iso(period_start_obj)
@@ -1046,7 +1046,7 @@ def render_sales_log(location_df: pd.DataFrame) -> None:
                         render_shared_preview(machine_a, machine_b, result)
                     else:
                         bk1, bk2 = st.columns(2)
-                        bk1.metric("Actual Transfer · X = Σ Net_Transfer", f"฿{x_val:,.2f}")
+                        bk1.metric("Actual Transfer · X = Σ Trans_Amount", f"฿{x_val:,.2f}")
                         bk2.metric("Bank Fee · Y = Σ Commission", f"฿{y_val:,.2f}")
 
         # Transfer machines need the matched bank data before saving.
