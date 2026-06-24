@@ -35,6 +35,7 @@ Author: Koricube Engineering
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import datetime, date
 from html import escape
 from typing import Any, List, Optional
@@ -110,6 +111,32 @@ BE_OFFSET = 543
 # and our unambiguous ISO ``YYYY-MM-DD`` strings as real dates, so the row-1
 # ArrayFormula logic can compute on them directly.
 VALUE_INPUT_OPTION = "USER_ENTERED"
+
+# Sales_Log full column schema (A → P). The first 11 are the original entry
+# fields; the trailing five (L→P) are the reconciliation outputs now written
+# explicitly from Python for full transparency.
+SALES_LOG_COLUMNS = [
+    "Collection_Date",    # A
+    "Machine_ID",         # B
+    "Branch_Name",        # C
+    "Merchant_No",        # D
+    "Payment_Type",       # E
+    "Machines_Shared",    # F
+    "Web_Total",          # G
+    "Cash_Collected",     # H
+    "Period_Start",       # I
+    "Period_End",         # J
+    "Remark",             # K
+    "Expected_Transfer",  # L
+    "Shared_Bank_Fee",    # M
+    "Net_Actual",         # N
+    "Status",             # O
+    "Diff_Adjustment",    # P
+]
+
+# Status values stamped into the Sales_Log "Status" column (O).
+RECON_STATUS_DONE = "กระทบยอดแล้ว"   # reconciled against bank data (Reconciled)
+RECON_STATUS_CASH = "เงินสด"          # cash-only machine, no bank transfer to reconcile
 
 
 # ===========================================================================
@@ -389,6 +416,213 @@ def _parse_settlement_cells(cells: List[str]) -> Optional[List[Any]]:
 
 
 # ===========================================================================
+# SHARED-MERCHANT RECONCILIATION LOGIC
+# ===========================================================================
+# Scenario: one Ksher merchant / one bank transfer covers TWO machines
+# (Machines_Shared == 2). The single transfer and its fee must be split fairly
+# between the two machines. This mirrors the finalised Excel model 1:1.
+#
+#   Expected_X      = Web_Total_X - Cash_Collected_X          (per machine)
+#   Total_Expected  = Expected_A + Expected_B
+#   Diff            = Actual_Transfer(X) - Total_Expected
+#   Diff_Adjustment = Diff / shares                           (split evenly)
+#   Shared_Bank_Fee = Total_Fee(Y) / shares                  (split evenly)
+#   Net_Actual_X    = Expected_X + Diff_Adjustment - Shared_Bank_Fee
+#
+# By construction the stored columns stay internally consistent:
+#   Net_Actual == Expected_Transfer + Diff_Adjustment - Shared_Bank_Fee
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    """Robustly coerce any cell/input into a float (blank/garbage -> default)."""
+    parsed = clean_number(value)
+    return float(parsed) if parsed is not None else float(default)
+
+
+@dataclass(frozen=True)
+class SharedReconResult:
+    """Immutable result of a 2-machine shared-merchant reconciliation."""
+    expected_a: float
+    expected_b: float
+    total_expected: float
+    actual_transfer: float    # X
+    diff: float               # X - total_expected
+    diff_adjustment: float    # diff / shares
+    total_fee: float          # Y
+    shared_bank_fee: float    # Y / shares
+    net_actual_a: float
+    net_actual_b: float
+
+
+def compute_shared_reconciliation(
+    web_a: Any, cash_a: Any,
+    web_b: Any, cash_b: Any,
+    actual_transfer: Any, total_fee: Any,
+    shares: int = 2,
+) -> SharedReconResult:
+    """
+    Translate the finalised Excel reconciliation into Python (see section header).
+
+    Verified 1:1 against the Excel model (e.g. row 3: Expected 1944/1043,
+    Diff 43, Diff/2 21.5, Fee/2 9.95 -> Net 1955.55 / 1054.55).
+
+    All inputs are coerced defensively so blank/None/"1,234.50" never crash.
+    ``shares`` is the divisor for the fair split (2 for this scenario); it is
+    floored to 1 to guarantee no division-by-zero. Results are rounded to 2 dp
+    AND the net is derived from the rounded split components, so the stored
+    columns always reconcile (Net == Expected + Diff_Adjustment - Shared_Fee).
+    """
+    shares = max(int(shares or 1), 1)
+
+    web_a, cash_a = _to_float(web_a), _to_float(cash_a)
+    web_b, cash_b = _to_float(web_b), _to_float(cash_b)
+    x, y = _to_float(actual_transfer), _to_float(total_fee)
+
+    expected_a = round(web_a - cash_a, 2)
+    expected_b = round(web_b - cash_b, 2)
+    total_expected = round(expected_a + expected_b, 2)
+
+    diff = round(x - total_expected, 2)
+    diff_adjustment = round(diff / shares, 2)
+    shared_bank_fee = round(y / shares, 2)
+
+    net_actual_a = round(expected_a + diff_adjustment - shared_bank_fee, 2)
+    net_actual_b = round(expected_b + diff_adjustment - shared_bank_fee, 2)
+
+    return SharedReconResult(
+        expected_a=expected_a, expected_b=expected_b,
+        total_expected=total_expected, actual_transfer=round(x, 2),
+        diff=diff, diff_adjustment=diff_adjustment,
+        total_fee=round(y, 2), shared_bank_fee=shared_bank_fee,
+        net_actual_a=net_actual_a, net_actual_b=net_actual_b,
+    )
+
+
+def build_shared_reconciliation_rows(
+    *, collection_date: str, period_start: str, period_end: str, remark: str,
+    machine_a: pd.Series, machine_b: pd.Series,
+    web_a: Any, cash_a: Any, web_b: Any, cash_b: Any,
+    result: SharedReconResult, status: str = RECON_STATUS_DONE,
+) -> List[List[Any]]:
+    """
+    Prepare the two append-ready Sales_Log rows (full 16-column schema, A→P).
+
+    Master fields (Branch / Merchant / Payment / Shared) are stamped from the
+    CURRENT Location data, exactly like the single-machine flow. Returns
+    ``[row_a, row_b]``; the caller appends each with ``append_row_safe`` so
+    row 1 (ArrayFormula) is never touched.
+    """
+    def _row(machine: pd.Series, web: Any, cash: Any,
+             expected: float, net: float) -> List[Any]:
+        return [
+            collection_date,               # A  Collection_Date
+            machine[LOC_MACHINE_ID],       # B  Machine_ID
+            machine[LOC_BRANCH],           # C  Branch_Name
+            machine[LOC_MERCHANT_NO],      # D  Merchant_No
+            machine[LOC_PAYMENT_TYPE],     # E  Payment_Type
+            machine[LOC_MACHINES_SHARED],  # F  Machines_Shared
+            _to_float(web),                # G  Web_Total
+            _to_float(cash),               # H  Cash_Collected
+            period_start,                  # I  Period_Start
+            period_end,                    # J  Period_End
+            remark,                        # K  Remark
+            expected,                      # L  Expected_Transfer
+            result.shared_bank_fee,        # M  Shared_Bank_Fee
+            net,                           # N  Net_Actual
+            status,                        # O  Status
+            result.diff_adjustment,        # P  Diff_Adjustment
+        ]
+
+    return [
+        _row(machine_a, web_a, cash_a, result.expected_a, result.net_actual_a),
+        _row(machine_b, web_b, cash_b, result.expected_b, result.net_actual_b),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Raw_Email auto-aggregation — sum the actual transfer (X) and fee (Y) for a
+# merchant across a Period_Start..Period_End date range.
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=120, show_spinner="Loading bank transfer data…")
+def fetch_raw_email_data() -> pd.DataFrame:
+    """
+    Read the Raw_Email settlement sheet into a tidy DataFrame (cached 2 min).
+
+    Use the sidebar "Refresh" button to force a re-read after new bank
+    statements are appended.
+    """
+    worksheet = get_worksheet(WS_RAW_EMAIL)
+    records = worksheet.get_all_records(expected_headers=RAW_EMAIL_FIELDS)
+    df = pd.DataFrame(records)
+    for col in RAW_EMAIL_FIELDS:
+        if col not in df.columns:
+            df[col] = ""
+    return df[RAW_EMAIL_FIELDS]
+
+
+def _digits_only(value: Any) -> str:
+    """Normalise a merchant number to digits only for robust matching."""
+    return re.sub(r"\D", "", str(value or ""))
+
+
+def aggregate_bank_transfers(
+    raw_df: pd.DataFrame, merchant_no: Any, start_iso: str, end_iso: str
+) -> Optional[tuple]:
+    """
+    Sum every Raw_Email settlement for ``merchant_no`` whose Transfer_Date falls
+    within the inclusive range [start, end].
+
+    Returns ``(X, Y)`` where:
+        X = SUM(Net_Transfer)   -> Actual Total Transfer
+        Y = SUM(Commission)     -> Total Bank Fee
+    rounded to 2 dp. Returns ``None`` when the merchant/dates are missing, no
+    rows fall in range, OR the transfer total X is 0 (treated as "not in yet").
+
+    Robustness: dates are normalised (BE->AD aware) and parsed with
+    ``errors='coerce'`` so blank/garbage Transfer_Date values become NaT and are
+    silently excluded — empty sets never raise.
+    """
+    target_merchant = _digits_only(merchant_no)
+    # A single supplied bound collapses the range to that one day.
+    start_iso = (start_iso or end_iso or "").strip()
+    end_iso = (end_iso or start_iso or "").strip()
+    if raw_df is None or raw_df.empty or not target_merchant or not start_iso:
+        return None
+
+    start_dt = pd.to_datetime(start_iso, errors="coerce")
+    end_dt = pd.to_datetime(end_iso, errors="coerce")
+    if pd.isna(start_dt) or pd.isna(end_dt):
+        return None
+
+    df = raw_df.copy()
+    df["_m"] = df["Merchant_No"].apply(_digits_only)
+    df["_d"] = pd.to_datetime(
+        df["Transfer_Date"].apply(normalize_date_string), errors="coerce"
+    )
+    mask = (df["_m"] == target_merchant) & (df["_d"] >= start_dt) & (df["_d"] <= end_dt)
+    match = df[mask]
+    if match.empty:
+        return None
+
+    x = round(float(match["Net_Transfer"].apply(_to_float).sum()), 2)
+    y = round(float(match["Commission"].apply(_to_float).sum()), 2)
+    if x == 0:  # no real transfer landed in this window yet
+        return None
+    return x, y
+
+
+def safe_aggregate_bank_transfers(
+    merchant_no: Any, start_iso: str, end_iso: str
+) -> Optional[tuple]:
+    """Cached Raw_Email aggregation that degrades gracefully if the sheet is unreadable."""
+    try:
+        raw_df = fetch_raw_email_data()
+    except Exception:  # noqa: BLE001 - treat a read failure as "no data yet"
+        return None
+    return aggregate_bank_transfers(raw_df, merchant_no, start_iso, end_iso)
+
+
+# ===========================================================================
 # PRESENTATION LAYER — "Kori Frost" CSS / HTML COMPONENTS (cosmetic only)
 # ===========================================================================
 def inject_css() -> None:
@@ -608,9 +842,10 @@ def render_status_card(machine: pd.Series, payment_type: str, is_cash_only: bool
     )
 
 
-def render_reconciliation_cue(web_total: float, cash_collected: float) -> None:
+def render_reconciliation_cue(web_total: Any, cash_collected: Any) -> None:
     """Live colour-coded delta between cash counted and web telemetry total."""
-    diff = round(cash_collected - web_total, 2)
+    # None-safe: empty inputs (value=None) are treated as 0.00 for the maths.
+    diff = round(_to_float(cash_collected) - _to_float(web_total), 2)
     if abs(diff) < 0.01:
         cls, label, val = "ok", "✅ ตรงกัน (Matched)", "0.00"
     elif diff > 0:
@@ -650,18 +885,14 @@ def render_sales_log(location_df: pd.DataFrame) -> None:
     # fix is to EXPLICITLY overwrite each key with its default value here, while
     # we're still ahead of widget instantiation this run.
     if st.session_state.get("sl_do_reset", False):
-        st.session_state["sl_cash"] = 0.00       # Cash Collected -> 0.00
-        st.session_state["sl_remark"] = ""        # Remark -> empty
+        st.session_state["sl_remark"] = ""               # Remark -> empty
         st.session_state["sl_cdate"] = now_bkk().date()  # Collection Date -> today
-
-        if "sl_web" in st.session_state:          # Web Total -> 0.00 (if visible)
-            st.session_state["sl_web"] = 0.00
-        if "sl_pstart" in st.session_state:       # Period Start -> empty (if visible)
-            st.session_state["sl_pstart"] = None
-        if "sl_pend" in st.session_state:         # Period End -> empty (if visible)
-            st.session_state["sl_pend"] = None
-
-        st.session_state["sl_do_reset"] = False   # clear the flag
+        # Clear every money/period key that may exist (single OR shared mode).
+        for _k in ("sl_cash", "sl_web", "sl_pstart", "sl_pend",
+                   "sl_web_a", "sl_cash_a", "sl_web_b", "sl_cash_b"):
+            if _k in st.session_state:
+                st.session_state[_k] = None
+        st.session_state["sl_do_reset"] = False          # clear the flag
 
     # One-shot success flash carried over from the run that just saved + reset.
     _flash = st.session_state.pop("sl_flash", None)
@@ -679,21 +910,44 @@ def render_sales_log(location_df: pd.DataFrame) -> None:
 
     payment_type = machine[LOC_PAYMENT_TYPE]
     is_cash_only = payment_type == PAYMENT_CASH_ONLY
+    merchant_no = machine[LOC_MERCHANT_NO]
+
+    # Dynamic mode detection: a machine flagged Machines_Shared == 2 is half of
+    # a pair sharing one bank merchant. We auto-locate its partner so the UI can
+    # expand to capture BOTH machines and append 2 rows on submit.
+    shared_flag = (not is_cash_only) and (
+        str(machine[LOC_MACHINES_SHARED]).strip() == "2"
+    )
+    partner = _find_pair_for(location_df, machine) if shared_flag else None
+    is_shared = shared_flag and (partner is not None)
 
     # Compact, single-line status badge (replaces bulky headings).
     render_status_card(machine, payment_type, is_cash_only)
 
+    # Misconfigured shared machine (flagged 2 but no partner) -> cannot reconcile.
+    if shared_flag and partner is None:
+        st.error(
+            f"⚠️ {machine[LOC_MACHINE_ID]} is flagged Machines_Shared = 2 but no "
+            f"partner with Merchant_No {merchant_no or '—'} was found. "
+            "Please fix the Location sheet before reconciling."
+        )
+        return
+
+    if is_shared:
+        st.caption(
+            f"🔗 Shared merchant {merchant_no or '—'} · pairs with "
+            f"{partner[LOC_MACHINE_ID]} ({partner[LOC_BRANCH]}) — 2 rows will be saved."
+        )
+
     # All inputs grouped inside one clean white card.
     with st.container(border=True):
-        # Manual collection date — defaults to today (Bangkok) but is fully
-        # back-datable, since coins are often counted at month-end yet entered a
-        # few days later. THIS chosen date is what lands in Column A.
+        # Manual, back-datable collection date -> lands in Column A.
         collection_date_obj: date = st.date_input(
             "Collection Date · วันที่เก็บยอด",
             value=now_bkk().date(), key="sl_cdate",
         )
 
-        # CRITICAL: period inputs only appear for 'โอน+เงินสด' machines.
+        # Period applies to every transfer machine (single OR shared).
         period_start_obj: Optional[date] = None
         period_end_obj: Optional[date] = None
         if not is_cash_only:
@@ -703,89 +957,252 @@ def render_sales_log(location_df: pd.DataFrame) -> None:
             period_end_obj = p2.date_input("Period End", value=None, key="sl_pend")
 
         st.markdown("**💰 Amounts · ยอดเงิน**")
-        # Cash-only machines have NO IoT telemetry -> hide Web Total entirely
-        # (it would otherwise be a confusing, formula-breaking field).
+        # Empty-by-default inputs (value=None + "0.00" placeholder) so the
+        # operator can type immediately without clearing a pre-filled 0.00.
+        web_total = cash_collected = None         # single-machine values
+        web_a = cash_a = web_b = cash_b = None    # shared-pair values
+        machine_a = machine_b = None
+
         if is_cash_only:
-            web_total = None  # nothing to capture; payload will send blank
+            # Cash-only: no telemetry, no Web Total.
             cash_collected = st.number_input(
                 "Cash Collected · เงินสดที่เก็บได้ (฿)",
-                min_value=0.0, step=1.0, format="%.2f", key="sl_cash",
+                value=None, min_value=0.0, step=1.0, format="%.2f",
+                placeholder="0.00", key="sl_cash",
             )
+        elif is_shared:
+            # Shared: capture BOTH machines (A = selected, B = partner).
+            machine_a, machine_b = machine, partner
+            st.markdown(
+                f"**🅰️ {escape(str(machine_a[LOC_MACHINE_ID]))}** · "
+                f"{escape(str(machine_a[LOC_BRANCH]))}"
+            )
+            a1, a2 = st.columns(2)
+            web_a = a1.number_input("Web Total A (฿)", value=None, min_value=0.0,
+                                    step=1.0, format="%.2f", placeholder="0.00",
+                                    key="sl_web_a")
+            cash_a = a2.number_input("Cash Collected A (฿)", value=None, min_value=0.0,
+                                     step=1.0, format="%.2f", placeholder="0.00",
+                                     key="sl_cash_a")
+            st.markdown(
+                f"**🅱️ {escape(str(machine_b[LOC_MACHINE_ID]))}** · "
+                f"{escape(str(machine_b[LOC_BRANCH]))}"
+            )
+            b1, b2 = st.columns(2)
+            web_b = b1.number_input("Web Total B (฿)", value=None, min_value=0.0,
+                                    step=1.0, format="%.2f", placeholder="0.00",
+                                    key="sl_web_b")
+            cash_b = b2.number_input("Cash Collected B (฿)", value=None, min_value=0.0,
+                                     step=1.0, format="%.2f", placeholder="0.00",
+                                     key="sl_cash_b")
         else:
+            # Single transfer machine.
             m1, m2 = st.columns(2)
             web_total = m1.number_input(
                 "Web Total · ยอดเว็บ (฿)",
-                min_value=0.0, step=1.0, format="%.2f", key="sl_web",
+                value=None, min_value=0.0, step=1.0, format="%.2f",
+                placeholder="0.00", key="sl_web",
             )
             cash_collected = m2.number_input(
                 "Cash Collected · เงินสดที่เก็บได้ (฿)",
-                min_value=0.0, step=1.0, format="%.2f", key="sl_cash",
+                value=None, min_value=0.0, step=1.0, format="%.2f",
+                placeholder="0.00", key="sl_cash",
             )
-            # Reconciliation only makes sense when web telemetry exists.
             render_reconciliation_cue(web_total, cash_collected)
 
         remark = st.text_area(
             "Remark · หมายเหตุ", placeholder="Optional notes…", key="sl_remark"
         )
 
-        submitted = st.button("Submit Sales Log", type="primary",
-                              use_container_width=True, key="sl_submit")
+        # --- Auto-aggregate the bank transfer (X, Y) over the PERIOD ----------
+        # X = Σ Net_Transfer, Y = Σ Commission, summed across the merchant's
+        # settlements in [Period_Start, Period_End]. No manual bank entry.
+        collection_date = date_to_iso(collection_date_obj) or today_iso()
+        period_start = "" if is_cash_only else date_to_iso(period_start_obj)
+        period_end = "" if is_cash_only else date_to_iso(period_end_obj)
+
+        bank: Optional[tuple] = None
+        result: Optional[SharedReconResult] = None
+        if not is_cash_only:
+            if not period_start or not period_end:
+                st.info(
+                    "Select Period Start and Period End to load the bank transfer "
+                    "for this period."
+                )
+            else:
+                bank = safe_aggregate_bank_transfers(merchant_no, period_start, period_end)
+                if bank is None:
+                    st.warning(
+                        f"⏳ Bank data for period {period_start} → {period_end} · "
+                        f"Merchant {merchant_no or '—'} is missing in Raw_Email — "
+                        "ยังไม่มีข้อมูลธนาคารสำหรับช่วงนี้. Submit is disabled."
+                    )
+                else:
+                    x_val, y_val = bank
+                    if is_shared:
+                        result = compute_shared_reconciliation(
+                            web_a, cash_a, web_b, cash_b, x_val, y_val, shares=2
+                        )
+                        render_shared_preview(machine_a, machine_b, result)
+                    else:
+                        bk1, bk2 = st.columns(2)
+                        bk1.metric("Actual Transfer · X = Σ Net_Transfer", f"฿{x_val:,.2f}")
+                        bk2.metric("Bank Fee · Y = Σ Commission", f"฿{y_val:,.2f}")
+
+        # Transfer machines need the matched bank data before saving.
+        submit_disabled = (not is_cash_only) and (bank is None)
+        submitted = st.button(
+            "Submit Sales Log", type="primary", use_container_width=True,
+            key="sl_submit", disabled=submit_disabled,
+        )
 
     if not submitted:
         return
 
-    # Re-stamp the CURRENT master values at submit time (per spec).
-    branch_name = machine[LOC_BRANCH]
-    merchant_no = machine[LOC_MERCHANT_NO]
-    machines_shared = machine[LOC_MACHINES_SHARED]
+    # Validate the period for transfer machines (single + shared).
+    if not is_cash_only:
+        if not period_start or not period_end:
+            st.error("Please provide both Period Start and Period End.")
+            return
+        if period_start > period_end:
+            st.error("Period Start must not be after Period End.")
+            return
+        if bank is None:
+            st.error("Bank data is not available for this period.")
+            return
 
-    period_start = "" if is_cash_only else date_to_iso(period_start_obj)
-    period_end = "" if is_cash_only else date_to_iso(period_end_obj)
+    # --- Build the row(s): 2 for a shared pair, 1 otherwise (uniform A→P) -----
+    if is_shared:
+        rows = build_shared_reconciliation_rows(
+            collection_date=collection_date, period_start=period_start,
+            period_end=period_end, remark=remark.strip(),
+            machine_a=machine_a, machine_b=machine_b,
+            web_a=web_a, cash_a=cash_a, web_b=web_b, cash_b=cash_b, result=result,
+        )
+    else:
+        rows = [build_single_sales_row(
+            collection_date=collection_date, machine=machine,
+            web_total=web_total, cash_collected=cash_collected,
+            period_start=period_start, period_end=period_end,
+            remark=remark.strip(), is_cash_only=is_cash_only, bank=bank,
+        )]
 
-    # The manually chosen collection date drives Column A (strict YYYY-MM-DD,
-    # Bangkok). Fall back to today only if somehow blank.
-    collection_date = date_to_iso(collection_date_obj) or today_iso()
-
-    # Cash-only machines have no telemetry -> send a blank Web_Total.
-    web_total_value: Any = "" if is_cash_only else float(web_total)
-
-    # Validate period inputs for transfer machines.
-    if not is_cash_only and (not period_start or not period_end):
-        st.error("Please provide both Period Start and Period End for this machine.")
-        return
-    if period_start and period_end and period_start > period_end:
-        st.error("Period Start must not be after Period End.")
-        return
-
-    # Payload order is contractually fixed — do not reorder.
-    payload = [
-        collection_date,          # Collection_Date (manual, back-datable)
-        machine[LOC_MACHINE_ID],  # Machine_ID
-        branch_name,              # Branch_Name
-        merchant_no,              # Merchant_No
-        payment_type,             # Payment_Type
-        machines_shared,          # Machines_Shared
-        web_total_value,          # Web_Total ("" for cash-only machines)
-        float(cash_collected),    # Cash_Collected
-        period_start,             # Period_Start
-        period_end,               # Period_End
-        remark.strip(),           # Remark
-    ]
-
+    # Append every row (append_row only -> row 1 ArrayFormula untouched).
     try:
-        append_row_safe(WS_SALES_LOG, payload)
+        for row in rows:
+            append_row_safe(WS_SALES_LOG, row)
     except Exception as exc:  # noqa: BLE001 - present any backend error nicely
         st.error(f"Failed to write to Sales_Log: {exc}")
         return
 
-    # Success: stash a one-shot flash, flag the input keys for reset, and rerun
-    # so the form comes back cleared (prevents accidental double-entries).
-    st.session_state["sl_flash"] = {
-        "msg": f"✅ Sales log saved for {machine[LOC_MACHINE_ID]} ({branch_name}).",
-        "caption": f"Collection date stamped: {collection_date}",
-    }
+    # One-shot success flash + reset, then rerun so the form comes back cleared.
+    if is_shared:
+        st.session_state["sl_flash"] = {
+            "msg": (f"✅ Saved 2 rows (shared) · Merchant {merchant_no}: "
+                    f"{machine_a[LOC_MACHINE_ID]} + {machine_b[LOC_MACHINE_ID]}."),
+            "caption": (f"Net A ฿{result.net_actual_a:,.2f} · "
+                        f"Net B ฿{result.net_actual_b:,.2f} · {collection_date}"),
+        }
+    else:
+        st.session_state["sl_flash"] = {
+            "msg": f"✅ Sales log saved for {machine[LOC_MACHINE_ID]} "
+                   f"({machine[LOC_BRANCH]}).",
+            "caption": f"Collection date stamped: {collection_date}",
+        }
     st.session_state["sl_do_reset"] = True
     st.rerun()
+
+
+# ===========================================================================
+# SALES LOG HELPERS — pair lookup · single-row builder · shared preview
+# ===========================================================================
+def _find_pair_for(location_df: pd.DataFrame, machine: pd.Series) -> Optional[pd.Series]:
+    """
+    Given a shared machine (Machines_Shared == 2), return its PARTNER — the
+    other machine sharing the same Merchant_No — or ``None`` if not found.
+    """
+    merchant = _digits_only(machine[LOC_MERCHANT_NO])
+    if not merchant:
+        return None
+    same = location_df[
+        (location_df[LOC_MERCHANT_NO].apply(_digits_only) == merchant)
+        & (location_df[LOC_MACHINE_ID] != machine[LOC_MACHINE_ID])
+        & (location_df[LOC_MACHINES_SHARED].astype(str).str.strip() == "2")
+    ]
+    return same.iloc[0] if not same.empty else None
+
+
+def build_single_sales_row(
+    *, collection_date: str, machine: pd.Series, web_total: Any, cash_collected: Any,
+    period_start: str, period_end: str, remark: str,
+    is_cash_only: bool, bank: Optional[tuple],
+) -> List[Any]:
+    """
+    Build ONE full 16-column Sales_Log row (A→P) for a single machine.
+
+    Single transfer machine (per spec): Diff_Adjustment = 0, Shared_Bank_Fee = Y,
+    Net_Actual = X, Expected_Transfer = Web − Cash.
+    Cash-only machine: no bank transfer -> L–P blank, Status = cash.
+    """
+    if is_cash_only:
+        web_value: Any = ""
+        expected = shared_fee = net_actual = diff_adj = ""
+        status = RECON_STATUS_CASH
+    else:
+        x_val, y_val = bank  # guaranteed present (submit was enabled)
+        web_value = _to_float(web_total)
+        expected = round(_to_float(web_total) - _to_float(cash_collected), 2)
+        shared_fee = round(_to_float(y_val), 2)   # M  Shared_Bank_Fee = Y
+        net_actual = round(_to_float(x_val), 2)   # N  Net_Actual = X
+        diff_adj = 0                              # P  Diff_Adjustment = 0
+        status = RECON_STATUS_DONE
+
+    return [
+        collection_date,               # A  Collection_Date
+        machine[LOC_MACHINE_ID],       # B  Machine_ID
+        machine[LOC_BRANCH],           # C  Branch_Name
+        machine[LOC_MERCHANT_NO],      # D  Merchant_No
+        machine[LOC_PAYMENT_TYPE],     # E  Payment_Type
+        machine[LOC_MACHINES_SHARED],  # F  Machines_Shared
+        web_value,                     # G  Web_Total ("" for cash-only)
+        _to_float(cash_collected),     # H  Cash_Collected
+        period_start,                  # I  Period_Start
+        period_end,                    # J  Period_End
+        remark,                        # K  Remark
+        expected,                      # L  Expected_Transfer
+        shared_fee,                    # M  Shared_Bank_Fee (= Y)
+        net_actual,                    # N  Net_Actual (= X)
+        status,                        # O  Status
+        diff_adj,                      # P  Diff_Adjustment
+    ]
+
+
+def render_shared_preview(machine_a: pd.Series, machine_b: pd.Series,
+                          r: SharedReconResult) -> None:
+    """Transparent, live breakdown of the shared reconciliation maths."""
+    st.markdown("**🔎 Reconciliation preview · ตรวจสอบการคำนวณ**")
+
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Total Expected", f"฿{r.total_expected:,.2f}")
+    s2.metric("Actual Transfer (X)", f"฿{r.actual_transfer:,.2f}")
+    s3.metric("Diff · X − Exp", f"฿{r.diff:,.2f}")
+    s4.metric("Total Fee (Y)", f"฿{r.total_fee:,.2f}")
+
+    s5, s6 = st.columns(2)
+    s5.metric("Diff ÷ 2 · Diff_Adjustment", f"฿{r.diff_adjustment:,.2f}")
+    s6.metric("Fee ÷ 2 · Shared_Bank_Fee", f"฿{r.shared_bank_fee:,.2f}")
+
+    n1, n2 = st.columns(2)
+    n1.metric(
+        f"🅰️ Net Actual · {machine_a[LOC_MACHINE_ID]}",
+        f"฿{r.net_actual_a:,.2f}",
+        delta=f"Expected ฿{r.expected_a:,.2f}", delta_color="off",
+    )
+    n2.metric(
+        f"🅱️ Net Actual · {machine_b[LOC_MACHINE_ID]}",
+        f"฿{r.net_actual_b:,.2f}",
+        delta=f"Expected ฿{r.expected_b:,.2f}", delta_color="off",
+    )
 
 
 # ===========================================================================
@@ -867,7 +1284,8 @@ def render_maintenance(location_df: pd.DataFrame) -> None:
         error_code = top2.selectbox("Error Code", ERROR_CODES)
         issue_desc = st.text_area("Issue Description (รายละเอียดปัญหา)")
         repair_cost = st.number_input(
-            "Repair Cost · ค่าซ่อม (฿)", min_value=0.0, step=1.0, format="%.2f"
+            "Repair Cost · ค่าซ่อม (฿)", value=None, min_value=0.0, step=1.0,
+            format="%.2f", placeholder="0.00",
         )
         submitted = st.form_submit_button(
             "Submit Repair Ticket", type="primary", use_container_width=True
@@ -884,7 +1302,7 @@ def render_maintenance(location_df: pd.DataFrame) -> None:
         machine[LOC_MACHINE_ID],   # Machine_ID
         error_code,                # Error_Code
         issue_desc.strip(),        # Issue_Desc
-        float(repair_cost),        # Repair_Cost
+        _to_float(repair_cost),    # Repair_Cost (None -> 0.0)
         "",                        # Resolved_Date (blank until resolved)
         STATUS_PENDING,            # Status -> "รอซ่อม"
     ]
@@ -923,6 +1341,7 @@ def main() -> None:
 
         if st.button("🔄 Refresh master data", use_container_width=True):
             fetch_location_data.clear()
+            fetch_raw_email_data.clear()  # also refresh bank-transfer lookups
             st.rerun()
 
         st.markdown("---")
@@ -936,7 +1355,7 @@ def main() -> None:
         st.error(f"Could not load Location master data: {exc}")
         st.stop()
 
-    # --- Feature tabs -------------------------------------------------------
+    # --- Feature tabs (Sales Log now handles single AND shared dynamically) --
     tab_sales, tab_pdf, tab_maint = st.tabs(
         ["📋 Sales Log", "🏦 Bank Statement", "🔧 Maintenance"]
     )
