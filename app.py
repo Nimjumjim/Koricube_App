@@ -43,14 +43,6 @@ from typing import Any, List, Optional
 import pandas as pd
 import streamlit as st
 
-# pdfplumber is only needed for the bank-statement feature; import lazily-safe
-# so the rest of the app still loads if the wheel is missing on a given host.
-try:
-    import pdfplumber
-    _PDFPLUMBER_AVAILABLE = True
-except Exception:  # pragma: no cover - environment dependent
-    _PDFPLUMBER_AVAILABLE = False
-
 import gspread
 
 # ---------------------------------------------------------------------------
@@ -117,6 +109,19 @@ MAINTENANCE_CODE_LABELS = {
 
 STATUS_PENDING = "รอซ่อม"          # default status for a technical repair ticket
 STATUS_EXPENSE_PAID = "เคลียร์แล้ว"  # default status for a settled expense entry
+
+# Maintenance sheet schema. Branch_Name (col C) is STAMPED from Location at
+# write time — mirrors the Sales_Log layout so the dashboard maps both alike.
+MAINTENANCE_COLUMNS = [
+    "Report_Date",    # A
+    "Machine_ID",     # B
+    "Branch_Name",    # C  (stamped)
+    "Error_Code",     # D
+    "Issue_Desc",     # E
+    "Repair_Cost",    # F
+    "Resolved_Date",  # G
+    "Status",         # H
+]
 
 # Buddhist Era offset (BE = AD + 543).
 BE_OFFSET = 543
@@ -323,9 +328,11 @@ def append_row_safe(worksheet_name: str, payload: List[Any]) -> None:
 
 
 # ===========================================================================
-# PDF EXTRACTION (Bank settlement report)
+# RAW_EMAIL SCHEMA  (bank settlement rows — populated by the statement bot)
 # ===========================================================================
-# Columns we expect to recover from each settlement row, in payload order.
+# Column order of the Raw_Email sheet, consumed by the date-range aggregation
+# (fetch_raw_email_data / aggregate_bank_transfers). The in-app PDF parser has
+# been retired now that a bot writes these rows directly.
 RAW_EMAIL_FIELDS = [
     "Transfer_Date",
     "Merchant_No",
@@ -334,99 +341,6 @@ RAW_EMAIL_FIELDS = [
     "VAT",
     "Net_Transfer",
 ]
-
-
-def extract_settlement_rows(pdf_file) -> pd.DataFrame:
-    """
-    Extract settlement rows from a bank PDF using pdfplumber.
-
-    Strategy
-    --------
-    1. Pull every table from every page with ``extract_tables()``.
-    2. Heuristically locate the 6 columns of interest.
-    3. Normalise dates (incl. Buddhist-Era -> AD) and clean numerics.
-
-    The whole body is wrapped by the caller in try/except so a structural
-    change in the bank's layout surfaces as a friendly error, not a crash.
-
-    Returns a DataFrame with exactly ``RAW_EMAIL_FIELDS`` columns.
-    """
-    if not _PDFPLUMBER_AVAILABLE:
-        raise RuntimeError(
-            "pdfplumber is not installed in this environment "
-            "(`pip install pdfplumber`)."
-        )
-
-    collected: List[List[Any]] = []
-
-    with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
-            for table in page.extract_tables() or []:
-                for row in table:
-                    cells = [("" if c is None else str(c).strip()) for c in row]
-                    if not any(cells):
-                        continue
-
-                    # Skip obvious header rows.
-                    joined = " ".join(cells).lower()
-                    if any(k in joined for k in ("merchant", "date", "amount",
-                                                 "commission", "vat", "net",
-                                                 "วันที่", "ยอด")):
-                        # Header-like; do not treat as data.
-                        continue
-
-                    parsed = _parse_settlement_cells(cells)
-                    if parsed is not None:
-                        collected.append(parsed)
-
-    df = pd.DataFrame(collected, columns=RAW_EMAIL_FIELDS)
-    if df.empty:
-        raise ValueError(
-            "No settlement rows could be located in this PDF. "
-            "The layout may have changed — please verify the file."
-        )
-    return df
-
-
-def _parse_settlement_cells(cells: List[str]) -> Optional[List[Any]]:
-    """
-    Map a raw list of table cells onto the 6 target fields.
-
-    Expects, after dropping empties, a row resembling:
-        [Transfer_Date, Merchant_No, Trans_Amount, Commission, VAT, Net_Transfer]
-
-    Returns ``None`` for rows that clearly are not data (so callers can skip).
-    """
-    values = [c for c in cells if c != ""]
-    if len(values) < 6:
-        return None
-
-    # Take the first cell as the date and the last four as the money columns;
-    # the merchant number is whatever sits between the date and the amounts.
-    transfer_date = normalize_date_string(values[0])
-
-    # The four right-most numeric-looking cells = amount/commission/vat/net.
-    trans_amount = clean_number(values[-4])
-    commission = clean_number(values[-3])
-    vat = clean_number(values[-2])
-    net_transfer = clean_number(values[-1])
-
-    # Merchant number: first non-date token that is not one of the 4 money cells.
-    merchant_no = ""
-    for v in values[1:-4]:
-        digits = re.sub(r"\D", "", v)
-        if digits:
-            merchant_no = digits
-            break
-    if not merchant_no:
-        merchant_no = re.sub(r"\D", "", values[1]) if len(values) > 1 else ""
-
-    # If the money columns failed to parse, this almost certainly isn't a data
-    # row — let the caller skip it.
-    if None in (trans_amount, commission, vat, net_transfer):
-        return None
-
-    return [transfer_date, merchant_no, trans_amount, commission, vat, net_transfer]
 
 
 # ===========================================================================
@@ -1220,65 +1134,6 @@ def render_shared_preview(machine_a: pd.Series, machine_b: pd.Series,
 
 
 # ===========================================================================
-# UI — FEATURE 2: BANK STATEMENT PROCESSOR  (อ่าน PDF ด้วย pdfplumber)
-# ===========================================================================
-def render_pdf_processor() -> None:
-    section_header("🏦", "Bank Statement Processor — อ่าน PDF ด้วย pdfplumber",
-                   "Extract settlement rows · auto-convert Buddhist Era → AD")
-
-    if not _PDFPLUMBER_AVAILABLE:
-        st.error("pdfplumber is not available in this environment.")
-        return
-
-    uploaded = st.file_uploader(
-        "Upload bank settlement report (PDF)", type=["pdf"],
-        accept_multiple_files=False,
-    )
-    if uploaded is None:
-        st.info("Upload a settlement PDF to begin extraction.")
-        return
-
-    # Robust extraction — a layout change yields a graceful error, never a crash.
-    try:
-        df = extract_settlement_rows(uploaded)
-    except Exception as exc:  # noqa: BLE001
-        st.error(
-            "Could not parse this PDF. The bank's layout may have changed.\n\n"
-            f"Details: {exc}"
-        )
-        return
-
-    st.success(f"Extracted {len(df)} settlement row(s). Review before saving.")
-    # Let the operator review (and lightly fix) before committing to the sheet.
-    edited = st.data_editor(
-        df, num_rows="dynamic", use_container_width=True, key="pdf_editor"
-    )
-
-    if st.button("Append all rows to Raw_Email", type="primary",
-                 use_container_width=True):
-        success, failed = 0, 0
-        for _, row in edited.iterrows():
-            payload = [
-                normalize_date_string(row["Transfer_Date"]),  # Transfer_Date (BE->AD)
-                re.sub(r"\D", "", str(row["Merchant_No"])),   # Merchant_No
-                clean_number(row["Trans_Amount"]),            # Trans_Amount
-                clean_number(row["Commission"]),              # Commission
-                clean_number(row["VAT"]),                     # VAT
-                clean_number(row["Net_Transfer"]),            # Net_Transfer
-            ]
-            try:
-                append_row_safe(WS_RAW_EMAIL, payload)
-                success += 1
-            except Exception:  # noqa: BLE001
-                failed += 1
-
-        if success:
-            st.success(f"✅ Appended {success} row(s) to Raw_Email.")
-        if failed:
-            st.error(f"⚠️ {failed} row(s) failed to append.")
-
-
-# ===========================================================================
 # UI — FEATURE 3: MAINTENANCE & EXPENSE LEDGER  (แจ้งซ่อม / บันทึกรายจ่าย)
 # ===========================================================================
 def _is_expense_code(code: str) -> bool:
@@ -1287,29 +1142,33 @@ def _is_expense_code(code: str) -> bool:
 
 
 def build_maintenance_row(
-    *, machine: pd.Series, code: str, desc: str, cost: Any, is_expense: bool
+    *, report_date: str, machine: pd.Series, code: str, desc: str,
+    cost: Any, is_expense: bool
 ) -> List[Any]:
     """
-    Build ONE Maintenance row using the existing 7-column schema:
-    [Report_Date, Machine_ID, Error_Code, Issue_Desc, Repair_Cost,
-     Resolved_Date, Status].
+    Build ONE Maintenance row using the 8-column schema (MAINTENANCE_COLUMNS):
+    [Report_Date, Machine_ID, Branch_Name, Error_Code, Issue_Desc,
+     Repair_Cost, Resolved_Date, Status].
 
-    Repairs default to pending (รอซ่อม) with a blank Resolved_Date; expense
-    entries are settled on entry (เคลียร์แล้ว) so Resolved_Date is stamped today.
+    ``report_date`` is the user-chosen date (YYYY-MM-DD) — the bill date/period
+    for expenses, or the report date for repairs. Branch_Name is stamped from
+    the CURRENT Location data. Repairs default to pending (รอซ่อม) with a blank
+    Resolved_Date; expense entries are settled on the bill date (เคลียร์แล้ว) so
+    Resolved_Date mirrors report_date.
     """
-    report_date = today_iso()
     if is_expense:
         status, resolved_date = STATUS_EXPENSE_PAID, report_date
     else:
         status, resolved_date = STATUS_PENDING, ""
     return [
-        report_date,               # Report_Date
-        machine[LOC_MACHINE_ID],   # Machine_ID
-        code,                      # Error_Code (technical code OR expense type)
-        desc.strip(),              # Issue_Desc / Description
-        _to_float(cost),           # Repair_Cost / amount (None -> 0.0)
-        resolved_date,             # Resolved_Date
-        status,                    # Status
+        report_date,               # A  Report_Date (bill date for expenses)
+        machine[LOC_MACHINE_ID],   # B  Machine_ID
+        machine[LOC_BRANCH],       # C  Branch_Name (stamped from Location)
+        code,                      # D  Error_Code (technical code OR expense type)
+        desc.strip(),              # E  Issue_Desc / Description
+        _to_float(cost),           # F  Repair_Cost / amount (None -> 0.0)
+        resolved_date,             # G  Resolved_Date
+        status,                    # H  Status
     ]
 
 
@@ -1331,6 +1190,11 @@ def render_maintenance(location_df: pd.DataFrame) -> None:
             "Error Code / Expense Type (ประเภทรายจ่าย)", MAINTENANCE_CODES,
             format_func=lambda c: MAINTENANCE_CODE_LABELS.get(c, c),
         )
+        # Back-datable date -> lands in Column A. For utility bills this is the
+        # bill date/month; for repairs it's the report date.
+        report_date_obj = st.date_input(
+            "Date / วันที่ (รอบบิลค่าน้ำ–ค่าไฟ)", value=now_bkk().date(),
+        )
         desc = st.text_area("Description / บันทึกเพิ่มเติม")
         cost = st.number_input(
             "Cost / ยอดเงิน (฿)", value=None, min_value=0.0, step=1.0,
@@ -1344,16 +1208,11 @@ def render_maintenance(location_df: pd.DataFrame) -> None:
         return
 
     is_expense = _is_expense_code(code)
-
-    # An expense ledger entry must carry a real amount; a repair may be logged
-    # before its cost is known, so 0 is tolerated there.
-    if is_expense and _to_float(cost) <= 0:
-        st.error("Expense entries require an amount greater than 0 (ยอดเงินต้องมากกว่า 0).")
-        return
-
+    report_date = date_to_iso(report_date_obj) or today_iso()
     machine = location_df.iloc[label_to_index[selected_label]]
     payload = build_maintenance_row(
-        machine=machine, code=code, desc=desc, cost=cost, is_expense=is_expense
+        report_date=report_date, machine=machine, code=code, desc=desc,
+        cost=cost, is_expense=is_expense,
     )
 
     try:
@@ -1364,8 +1223,8 @@ def render_maintenance(location_df: pd.DataFrame) -> None:
 
     kind = "Expense" if is_expense else "Repair ticket"
     st.success(
-        f"✅ {kind} saved for {machine[LOC_MACHINE_ID]} · {code} "
-        f"(status: {payload[6]})."
+        f"✅ {kind} saved for {machine[LOC_MACHINE_ID]} · {machine[LOC_BRANCH]} · "
+        f"{code} (status: {payload[-1]})."
     )
 
 
@@ -1406,13 +1265,11 @@ def main() -> None:
         st.stop()
 
     # --- Feature tabs (Sales Log now handles single AND shared dynamically) --
-    tab_sales, tab_pdf, tab_maint = st.tabs(
-        ["📋 Sales Log", "🏦 Bank Statement", "🔧 Maintenance"]
+    tab_sales, tab_maint = st.tabs(
+        ["📋 Sales Log", "🧾 Maintenance & Expenses"]
     )
     with tab_sales:
         render_sales_log(location_df)
-    with tab_pdf:
-        render_pdf_processor()
     with tab_maint:
         render_maintenance(location_df)
 
