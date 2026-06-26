@@ -1515,12 +1515,29 @@ def _dashboard_table(view: pd.DataFrame) -> None:
                       Maintenance=("Maintenance_Cost", "sum"),
                       Net_Profit=("Net_Profit", "sum"))
                  .sort_values(["Branch_Name", "Month_Label"]))
-    money = st.column_config.NumberColumn(format="฿%.2f")
+
+    # Display expenses as negative deductions (cosmetic only — the underlying
+    # Net_Profit is already revenue − expenses). Each row then reads naturally:
+    # Cash + Transfer − Water − Elec − Rent − Maintenance = Net_Profit.
+    for col in ["Water", "Elec", "Rent", "Maintenance"]:
+        table[col] = table[col].map(lambda v: -abs(v) if abs(v) > 1e-9 else 0.0)
+
+    def money(label: str):
+        return st.column_config.NumberColumn(label, format="฿%.2f")
+
     st.dataframe(
         table, use_container_width=True, hide_index=True,
-        column_config={c: money for c in
-                       ["Cash", "Transfer", "Water", "Elec", "Rent",
-                        "Maintenance", "Net_Profit"]},
+        column_config={
+            "Branch_Name": st.column_config.TextColumn("สาขา"),
+            "Month_Label": st.column_config.TextColumn("เดือน"),
+            "Cash": money("เงินสด"),
+            "Transfer": money("เงินโอน"),
+            "Water": money("ค่าน้ำ"),
+            "Elec": money("ค่าไฟ"),
+            "Rent": money("ค่าเช่า"),
+            "Maintenance": money("ค่าซ่อม/อื่นๆ"),
+            "Net_Profit": money("กำไรสุทธิ"),
+        },
     )
 
 
