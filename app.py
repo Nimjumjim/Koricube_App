@@ -279,8 +279,16 @@ def get_client() -> gspread.Client:
     """
     Authenticate once and cache the gspread client for the whole session.
 
-    Uses a service-account key file as mandated by the architecture.
+    Deploy-friendly: on Streamlit Cloud the key lives in st.secrets under
+    ``[gcp_service_account]`` (nothing committed to git); locally it falls back
+    to the ``service_account.json`` file for development.
     """
+    try:
+        secret = st.secrets["gcp_service_account"]
+    except Exception:  # noqa: BLE001 - no secrets file locally -> use the JSON
+        secret = None
+    if secret:
+        return gspread.service_account_from_dict(dict(secret))
     return gspread.service_account(filename=SERVICE_ACCOUNT_FILE)
 
 
@@ -1244,7 +1252,7 @@ DASH_NUMERIC = [
     "Rent_Cost", "Water_Cost", "Electric_Cost", "Maintenance_Cost",
 ]
 DASH_COLUMNS = [
-    "Month", "Month_Label", "Machine_ID", "Branch_Name",
+    "Month", "Month_Label", "Machine_ID", "Branch_Name", "Machine_Type",
     "Cash_Revenue", "Transfer_Revenue", "Total_Revenue",
     "Rent_Cost", "Water_Cost", "Electric_Cost", "Maintenance_Cost",
     "Total_Expenses", "Net_Profit", "Source",
@@ -1329,6 +1337,15 @@ def _machine_branch_map(*frames: pd.DataFrame) -> dict:
             if mid and branch and mid not in mapping:
                 mapping[mid] = branch
     return mapping
+
+
+def _machine_type_map(df_loc: pd.DataFrame) -> dict:
+    """Machine_ID -> Machine_Type (e.g. Water / Ice) from the Location sheet."""
+    if df_loc.empty:
+        return {}
+    return {mid: typ for mid, typ in
+            zip(_series_str(df_loc, LOC_MACHINE_ID),
+                _series_str(df_loc, LOC_MACHINE_TYPE)) if mid and typ}
 
 
 def _location_rent_df(df_loc: pd.DataFrame) -> pd.DataFrame:
@@ -1457,6 +1474,10 @@ def load_and_prep_dashboard_data() -> pd.DataFrame:
     master["Machine_ID"] = _series_str(master, "Machine_ID")
     master["Branch_Name"] = (_series_str(master, "Branch_Name")
                              .replace("", "ไม่ระบุสาขา"))
+    # Map machine type (Water / Ice) from Location for the drill-down slicer.
+    type_map = _machine_type_map(df_loc)
+    master["Machine_Type"] = (master["Machine_ID"].map(type_map)
+                              .fillna("").replace("", "ไม่ระบุ"))
 
     master = _dedupe_machine_month(master)
     master["Total_Revenue"] = master["Cash_Revenue"] + master["Transfer_Revenue"]
@@ -1589,6 +1610,40 @@ def _dashboard_table(view: pd.DataFrame) -> None:
     st.dataframe(styler, use_container_width=True, hide_index=True)
 
 
+def _dashboard_branch_chart(view: pd.DataFrame) -> None:
+    """Grouped-bar comparison of the selected branches, month by month."""
+    metric_label = st.selectbox(
+        "ตัวชี้วัดที่เปรียบเทียบ",
+        ["กำไรสุทธิ", "รายรับรวม", "รายจ่ายรวม"], index=0, key="branch_metric",
+    )
+    metric_col = {
+        "กำไรสุทธิ": "Net_Profit",
+        "รายรับรวม": "Total_Revenue",
+        "รายจ่ายรวม": "Total_Expenses",
+    }[metric_label]
+
+    g = (view.groupby(["Branch_Name", "Month"], as_index=False)
+             .agg(Value=(metric_col, "sum"))
+             .sort_values("Month"))
+    if g.empty:
+        return
+    g["Month_Disp"] = g["Month"].dt.strftime("%b %Y")
+    order = g.drop_duplicates("Month").sort_values("Month")["Month_Disp"].tolist()
+
+    chart = alt.Chart(g).mark_bar().encode(
+        x=alt.X("Month_Disp:O", title="เดือน", sort=order,
+                axis=alt.Axis(labelAngle=0, grid=False)),
+        xOffset=alt.XOffset("Branch_Name:N"),
+        y=alt.Y("Value:Q", title="บาท"),
+        color=alt.Color("Branch_Name:N", title="สาขา",
+                        scale=alt.Scale(scheme="tableau10")),
+        tooltip=[alt.Tooltip("Branch_Name:N", title="สาขา"),
+                 alt.Tooltip("Month_Disp:O", title="เดือน"),
+                 alt.Tooltip("Value:Q", title=metric_label, format=",.2f")],
+    ).properties(height=360)
+    st.altair_chart(chart, use_container_width=True)
+
+
 def render_dashboard() -> None:
     section_header("📊", "Dashboard — ภาพรวมธุรกิจ",
                    "Revenue, expenses & net profit · filter by branch and month")
@@ -1602,14 +1657,18 @@ def render_dashboard() -> None:
         return
 
     branches = sorted(b for b in df_master["Branch_Name"].unique() if b)
+    types = sorted(t for t in df_master["Machine_Type"].unique() if t)
     months = sorted(df_master["Month_Label"].unique())
     with st.container(border=True):
         f1, f2 = st.columns(2)
         sel_branches = f1.multiselect("Select Branch (สาขา)", branches, default=branches)
-        sel_months = f2.multiselect("Select Month/Year (เดือน/ปี)", months, default=months)
+        sel_types = f2.multiselect("Select Type (ประเภทตู้ · น้ำ/น้ำแข็ง)",
+                                   types, default=types)
+        sel_months = st.multiselect("Select Month/Year (เดือน/ปี)", months, default=months)
 
     view = df_master[
         df_master["Branch_Name"].isin(sel_branches)
+        & df_master["Machine_Type"].isin(sel_types)
         & df_master["Month_Label"].isin(sel_months)
     ]
     if view.empty:
@@ -1623,6 +1682,8 @@ def render_dashboard() -> None:
     _dashboard_monthly_table(view)
     st.markdown("**📋 สรุปแยกสาขา/เดือน**")
     _dashboard_table(view)
+    st.markdown("**🏢 เปรียบเทียบสาขา · รายเดือน**")
+    _dashboard_branch_chart(view)
 
 
 # ===========================================================================
