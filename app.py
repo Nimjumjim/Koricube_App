@@ -1480,29 +1480,76 @@ def _dashboard_kpis(view: pd.DataFrame) -> None:
     c3.metric("Net Profit · กำไรสุทธิ", f"฿{profit:,.2f}", delta=f"{margin:,.1f}% margin")
 
 
+def _profit_css(value: float) -> str:
+    """Green text for positive net profit, red for negative, plain for zero."""
+    if value > 0:
+        return "color: #16a34a; font-weight: 600"   # green
+    if value < 0:
+        return "color: #dc2626; font-weight: 600"   # red
+    return ""
+
+
+def _negate_expense(v: float) -> float:
+    """Show a cost as a negative deduction (exact zero stays 0.0, not -0.0)."""
+    return -abs(v) if abs(v) > 1e-9 else 0.0
+
+
 def _dashboard_trend_chart(view: pd.DataFrame) -> None:
-    monthly = view.groupby("Month", as_index=False).agg(
-        Total_Revenue=("Total_Revenue", "sum"),
-        Net_Profit=("Net_Profit", "sum"),
-    )
+    monthly = (view.groupby(["Month", "Month_Label"], as_index=False)
+                   .agg(Total_Revenue=("Total_Revenue", "sum"),
+                        Net_Profit=("Net_Profit", "sum"))
+                   .sort_values("Month"))
     if monthly.empty:
         return
-    base = alt.Chart(monthly).encode(x=alt.X("Month:T", title="Month"))
-    bar = base.mark_bar(color="#0EA5E9", opacity=0.65, size=26).encode(
+
+    # Discrete, evenly-spaced MONTHLY axis (one label per month, chronological)
+    # instead of a temporal axis that auto-ticks by week and looks cluttered.
+    monthly["Month_Disp"] = monthly["Month"].dt.strftime("%b %Y")
+    x = alt.X("Month_Disp:O", title="เดือน", sort=monthly["Month_Disp"].tolist(),
+              axis=alt.Axis(labelAngle=0, grid=False))
+
+    base = alt.Chart(monthly).encode(x=x)
+    bar = base.mark_bar(color="#0EA5E9", opacity=0.65, size=30).encode(
         y=alt.Y("Total_Revenue:Q", title="฿"),
-        tooltip=[alt.Tooltip("Month:T", title="Month"),
-                 alt.Tooltip("Total_Revenue:Q", title="Revenue", format=",.2f")],
+        tooltip=[alt.Tooltip("Month_Disp:O", title="เดือน"),
+                 alt.Tooltip("Total_Revenue:Q", title="รายรับรวม", format=",.2f")],
     )
     line = base.mark_line(color="#0F172A", point=True, strokeWidth=2.5).encode(
         y=alt.Y("Net_Profit:Q"),
-        tooltip=[alt.Tooltip("Month:T", title="Month"),
-                 alt.Tooltip("Net_Profit:Q", title="Net Profit", format=",.2f")],
+        tooltip=[alt.Tooltip("Month_Disp:O", title="เดือน"),
+                 alt.Tooltip("Net_Profit:Q", title="กำไรสุทธิ", format=",.2f")],
     )
-    st.caption("🟦 Bar = Total Revenue · ⬛ Line = Net Profit")
+    # Data labels on top of each revenue bar.
+    bar_labels = base.mark_text(
+        dy=-8, color="#0284C7", fontSize=11, fontWeight="bold",
+    ).encode(
+        y=alt.Y("Total_Revenue:Q"),
+        text=alt.Text("Total_Revenue:Q", format=",.0f"),
+    )
+    st.caption("🟦 แท่ง = รายรับรวม · ⬛ เส้น = กำไรสุทธิ")
     st.altair_chart(
-        alt.layer(bar, line).resolve_scale(y="shared").properties(height=340),
+        alt.layer(bar, line, bar_labels).resolve_scale(y="shared").properties(height=340),
         use_container_width=True,
     )
+
+
+def _dashboard_monthly_table(view: pd.DataFrame) -> None:
+    """Compact monthly overview (all branches): revenue / expenses / net profit."""
+    monthly = (view.groupby("Month_Label", as_index=False)
+                   .agg(Revenue=("Total_Revenue", "sum"),
+                        Expenses=("Total_Expenses", "sum"),
+                        Net=("Net_Profit", "sum"))
+                   .sort_values("Month_Label"))
+    monthly["Expenses"] = monthly["Expenses"].map(_negate_expense)
+    monthly = monthly.rename(columns={
+        "Month_Label": "เดือน", "Revenue": "รายรับรวม",
+        "Expenses": "รายจ่ายรวม", "Net": "กำไรสุทธิ",
+    })
+    money_cols = ["รายรับรวม", "รายจ่ายรวม", "กำไรสุทธิ"]
+    styler = (monthly.style
+              .format("฿{:,.2f}", subset=money_cols)
+              .apply(lambda s: [_profit_css(v) for v in s], subset=["กำไรสุทธิ"]))
+    st.dataframe(styler, use_container_width=True, hide_index=True)
 
 
 def _dashboard_table(view: pd.DataFrame) -> None:
@@ -1516,29 +1563,25 @@ def _dashboard_table(view: pd.DataFrame) -> None:
                       Net_Profit=("Net_Profit", "sum"))
                  .sort_values(["Branch_Name", "Month_Label"]))
 
-    # Display expenses as negative deductions (cosmetic only — the underlying
-    # Net_Profit is already revenue − expenses). Each row then reads naturally:
-    # Cash + Transfer − Water − Elec − Rent − Maintenance = Net_Profit.
+    # Display expenses as negative deductions (cosmetic only — Net_Profit is
+    # already revenue − expenses): Cash + Transfer − Water − Elec − Rent −
+    # Maintenance = Net_Profit.
     for col in ["Water", "Elec", "Rent", "Maintenance"]:
-        table[col] = table[col].map(lambda v: -abs(v) if abs(v) > 1e-9 else 0.0)
+        table[col] = table[col].map(_negate_expense)
 
-    def money(label: str):
-        return st.column_config.NumberColumn(label, format="฿%.2f")
-
-    st.dataframe(
-        table, use_container_width=True, hide_index=True,
-        column_config={
-            "Branch_Name": st.column_config.TextColumn("สาขา"),
-            "Month_Label": st.column_config.TextColumn("เดือน"),
-            "Cash": money("เงินสด"),
-            "Transfer": money("เงินโอน"),
-            "Water": money("ค่าน้ำ"),
-            "Elec": money("ค่าไฟ"),
-            "Rent": money("ค่าเช่า"),
-            "Maintenance": money("ค่าซ่อม/อื่นๆ"),
-            "Net_Profit": money("กำไรสุทธิ"),
-        },
-    )
+    table = table.rename(columns={
+        "Branch_Name": "สาขา", "Month_Label": "เดือน",
+        "Cash": "เงินสด", "Transfer": "เงินโอน", "Water": "ค่าน้ำ",
+        "Elec": "ค่าไฟ", "Rent": "ค่าเช่า", "Maintenance": "ค่าซ่อม/อื่นๆ",
+        "Net_Profit": "กำไรสุทธิ",
+    })
+    money_cols = ["เงินสด", "เงินโอน", "ค่าน้ำ", "ค่าไฟ", "ค่าเช่า",
+                  "ค่าซ่อม/อื่นๆ", "กำไรสุทธิ"]
+    # pandas Styler: commas via format(), green/red Net_Profit via apply().
+    styler = (table.style
+              .format("฿{:,.2f}", subset=money_cols)
+              .apply(lambda s: [_profit_css(v) for v in s], subset=["กำไรสุทธิ"]))
+    st.dataframe(styler, use_container_width=True, hide_index=True)
 
 
 def render_dashboard() -> None:
@@ -1571,7 +1614,9 @@ def render_dashboard() -> None:
     _dashboard_kpis(view)
     st.markdown("**📈 Monthly trend · แนวโน้มรายเดือน**")
     _dashboard_trend_chart(view)
-    st.markdown("**📋 Summary by branch & month · สรุปแยกสาขา/เดือน**")
+    st.markdown("**🗓️ สรุปรายเดือน (รวมทุกสาขา)**")
+    _dashboard_monthly_table(view)
+    st.markdown("**📋 สรุปแยกสาขา/เดือน**")
     _dashboard_table(view)
 
 
