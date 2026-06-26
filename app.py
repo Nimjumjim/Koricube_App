@@ -40,6 +40,7 @@ from datetime import datetime, date
 from html import escape
 from typing import Any, List, Optional
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -70,6 +71,10 @@ WS_LOCATION = "Location"
 WS_SALES_LOG = "Sales_Log"
 WS_RAW_EMAIL = "Raw_Email"
 WS_MAINTENANCE = "Maintenance"
+WS_FINAL_DB = "Final_Database"   # legacy, pre-calculated history for the dashboard
+
+# Location column that stores each machine's fixed monthly rent (dashboard only).
+LOC_RENT_COST = "Rent_Cost"
 
 # Location master-data column headers (row 1 of the Location sheet).
 LOC_MACHINE_ID = "Machine_ID"
@@ -1229,6 +1234,331 @@ def render_maintenance(location_df: pd.DataFrame) -> None:
 
 
 # ===========================================================================
+# DASHBOARD — Hybrid data prep (legacy + current) → interactive analytics
+# ===========================================================================
+# Master grain is (Machine_ID, Month). Revenue comes from Sales_Log, the
+# variable bills from Maintenance, fixed Rent is mapped once-per-machine-month
+# from Location, and the legacy Final_Database supplies pre-calculated history.
+DASH_NUMERIC = [
+    "Cash_Revenue", "Transfer_Revenue",
+    "Rent_Cost", "Water_Cost", "Electric_Cost", "Maintenance_Cost",
+]
+DASH_COLUMNS = [
+    "Month", "Month_Label", "Machine_ID", "Branch_Name",
+    "Cash_Revenue", "Transfer_Revenue", "Total_Revenue",
+    "Rent_Cost", "Water_Cost", "Electric_Cost", "Maintenance_Cost",
+    "Total_Expenses", "Net_Profit", "Source",
+]
+
+
+def _fetch_records_df(ws_name: str) -> pd.DataFrame:
+    """
+    Read a worksheet into a DataFrame; empty on any failure (missing sheet /
+    duplicate headers). UNFORMATTED_VALUE returns real numbers (so a Repair_Cost
+    cell mis-formatted as a date still reads as its number) and dates as serials,
+    which ``_to_month_start`` handles explicitly.
+    """
+    try:
+        ws = get_worksheet(ws_name)
+        try:
+            records = ws.get_all_records(value_render_option="UNFORMATTED_VALUE")
+        except TypeError:  # very old gspread without the kwarg
+            records = ws.get_all_records()
+        return pd.DataFrame(records)
+    except Exception:  # noqa: BLE001
+        return pd.DataFrame()
+
+
+def _series_num(df: pd.DataFrame, *names: str, default: float = 0.0) -> pd.Series:
+    """First matching column coerced to float; a default-filled series if absent."""
+    for name in names:
+        if name in df.columns:
+            return df[name].map(_to_float)
+    return pd.Series(default, index=df.index, dtype=float)
+
+
+def _series_str(df: pd.DataFrame, *names: str, default: str = "") -> pd.Series:
+    """First matching column as stripped strings; a default-filled series if absent."""
+    for name in names:
+        if name in df.columns:
+            return df[name].astype(str).str.strip()
+    return pd.Series(default, index=df.index, dtype=object)
+
+
+def _series_raw(df: pd.DataFrame, *names: str) -> pd.Series:
+    """
+    First matching column UNCHANGED (no string coercion); all-None if absent.
+
+    Used for date columns so ``_to_month_start`` still sees numeric Google-Sheets
+    serials (UNFORMATTED_VALUE) instead of pre-stringified text.
+    """
+    for name in names:
+        if name in df.columns:
+            return df[name]
+    return pd.Series([None] * len(df), index=df.index, dtype=object)
+
+
+def _to_month_start(values: pd.Series) -> pd.Series:
+    """
+    Normalise a date-ish column to the first day of its month (Timestamp).
+
+    Handles three shapes robustly: ISO/locale strings (incl. Buddhist Era),
+    Google-Sheets serial numbers (UNFORMATTED dates), and blanks -> NaT.
+    """
+    epoch = pd.Timestamp("1899-12-30")  # Google Sheets day 0
+
+    def parse(v: Any):
+        if isinstance(v, bool):
+            return pd.NaT
+        if isinstance(v, (int, float)):
+            return epoch + pd.to_timedelta(int(v), unit="D") if 1 <= v <= 80000 else pd.NaT
+        return pd.to_datetime(normalize_date_string(v), errors="coerce")
+
+    parsed = pd.to_datetime(values.map(parse), errors="coerce")
+    return parsed.dt.to_period("M").dt.to_timestamp()
+
+
+def _machine_branch_map(*frames: pd.DataFrame) -> dict:
+    """Machine_ID -> Branch_Name (first non-empty wins across the given frames)."""
+    mapping: dict = {}
+    for df in frames:
+        if df is None or df.empty:
+            continue
+        for mid, branch in zip(_series_str(df, "Machine_ID"),
+                               _series_str(df, "Branch_Name", LOC_BRANCH)):
+            if mid and branch and mid not in mapping:
+                mapping[mid] = branch
+    return mapping
+
+
+def _location_rent_df(df_loc: pd.DataFrame) -> pd.DataFrame:
+    """One fixed monthly rent per Machine_ID (0 if the column is absent)."""
+    if df_loc.empty:
+        return pd.DataFrame(columns=["Machine_ID", "Rent_Cost"])
+    return pd.DataFrame({
+        "Machine_ID": _series_str(df_loc, LOC_MACHINE_ID),
+        "Rent_Cost": _series_num(df_loc, LOC_RENT_COST, "Rent"),
+    }).drop_duplicates("Machine_ID")
+
+
+def _prep_sales_revenue(df_sl: pd.DataFrame) -> pd.DataFrame:
+    """Sales_Log -> per-(Machine_ID, Month) Cash_Revenue + Transfer_Revenue."""
+    cols = ["Machine_ID", "Month", "Branch_Name", "Cash_Revenue", "Transfer_Revenue"]
+    if df_sl.empty:
+        return pd.DataFrame(columns=cols)
+    raw = pd.DataFrame({
+        "Machine_ID": _series_str(df_sl, "Machine_ID"),
+        "Branch_Name": _series_str(df_sl, "Branch_Name"),
+        "Month": _to_month_start(_series_raw(df_sl, "Collection_Date")),
+        "Cash_Revenue": _series_num(df_sl, "Cash_Collected"),
+        "Transfer_Revenue": _series_num(df_sl, "Net_Actual"),
+    }).dropna(subset=["Month"])
+    raw = raw[raw["Machine_ID"] != ""]
+    return raw.groupby(["Machine_ID", "Month"], as_index=False).agg(
+        Branch_Name=("Branch_Name", "first"),
+        Cash_Revenue=("Cash_Revenue", "sum"),
+        Transfer_Revenue=("Transfer_Revenue", "sum"),
+    )
+
+
+def _prep_maintenance_costs(df_mt: pd.DataFrame) -> pd.DataFrame:
+    """Maintenance -> per-(Machine_ID, Month) Water / Electric / Maintenance costs."""
+    cols = ["Machine_ID", "Month", "Water_Cost", "Electric_Cost", "Maintenance_Cost"]
+    if df_mt.empty:
+        return pd.DataFrame(columns=cols)
+    code = _series_str(df_mt, "Error_Code")
+    cost = _series_num(df_mt, "Repair_Cost")
+    raw = pd.DataFrame({
+        "Machine_ID": _series_str(df_mt, "Machine_ID"),
+        "Month": _to_month_start(_series_raw(df_mt, "Report_Date")),
+        "Water_Cost": cost.where(code == "BILL-WATER", 0.0),
+        "Electric_Cost": cost.where(code == "BILL-ELEC", 0.0),
+        "Maintenance_Cost": cost.where(~code.isin(["BILL-WATER", "BILL-ELEC"]), 0.0),
+    }).dropna(subset=["Month"])
+    raw = raw[raw["Machine_ID"] != ""]
+    return raw.groupby(["Machine_ID", "Month"], as_index=False)[
+        ["Water_Cost", "Electric_Cost", "Maintenance_Cost"]
+    ].sum()
+
+
+def _assemble_current(df_sl: pd.DataFrame, df_mt: pd.DataFrame,
+                      rent_df: pd.DataFrame, branch_map: dict) -> pd.DataFrame:
+    """Merge current revenue + bills, stamp rent once per machine-month."""
+    rev = _prep_sales_revenue(df_sl)
+    exp = _prep_maintenance_costs(df_mt)
+    if rev.empty and exp.empty:
+        return pd.DataFrame()
+
+    cur = pd.merge(rev, exp, on=["Machine_ID", "Month"], how="outer")
+    for c in ["Cash_Revenue", "Transfer_Revenue",
+              "Water_Cost", "Electric_Cost", "Maintenance_Cost"]:
+        cur[c] = pd.to_numeric(cur[c], errors="coerce").fillna(0.0) if c in cur else 0.0
+    if "Branch_Name" not in cur:
+        cur["Branch_Name"] = ""
+    blank = cur["Branch_Name"].isna() | (cur["Branch_Name"].astype(str).str.strip() == "")
+    cur.loc[blank, "Branch_Name"] = cur.loc[blank, "Machine_ID"].map(branch_map)
+
+    cur = cur.merge(rent_df, on="Machine_ID", how="left")
+    cur["Rent_Cost"] = pd.to_numeric(cur.get("Rent_Cost"), errors="coerce").fillna(0.0)
+    cur["Source"] = "current"
+    return cur
+
+
+def _prep_legacy(df_final: pd.DataFrame) -> pd.DataFrame:
+    """Final_Database -> master columns (defensive candidate-name lookups)."""
+    if df_final.empty:
+        return pd.DataFrame()
+    out = pd.DataFrame({
+        "Machine_ID": _series_str(df_final, "Machine_ID"),
+        "Branch_Name": _series_str(df_final, "Branch_Name", LOC_BRANCH),
+        "Month": _to_month_start(
+            _series_raw(df_final, "Date", "Month", "Collection_Date", "Report_Date")
+        ),
+        "Cash_Revenue": _series_num(df_final, "Cash_Revenue", "Cash", "Cash_Collected"),
+        "Transfer_Revenue": _series_num(df_final, "Transfer_Revenue", "Net_Actual", "Transfer"),
+        "Rent_Cost": _series_num(df_final, "Rent_Cost", "Rent"),
+        "Water_Cost": _series_num(df_final, "Water_Cost", "Water"),
+        "Electric_Cost": _series_num(df_final, "Electric_Cost", "Electric", "Elec"),
+        "Maintenance_Cost": _series_num(df_final, "Maintenance_Cost", "Maintenance", "Repair_Cost"),
+    }).dropna(subset=["Month"])
+    out["Source"] = "legacy"
+    return out
+
+
+def _dedupe_machine_month(master: pd.DataFrame) -> pd.DataFrame:
+    """If a (Machine_ID, Month) exists in both sources, keep the current one."""
+    if master.empty:
+        return master
+    master = master.copy()
+    master["_pri"] = (master["Source"] == "current").astype(int)
+    return (master.sort_values("_pri", ascending=False)
+                  .drop_duplicates(subset=["Machine_ID", "Month"], keep="first")
+                  .drop(columns="_pri"))
+
+
+@st.cache_data(ttl=120, show_spinner="Building dashboard…")
+def load_and_prep_dashboard_data() -> pd.DataFrame:
+    """Single tidy master DataFrame (legacy ⊕ current) for the dashboard."""
+    df_sl = _fetch_records_df(WS_SALES_LOG)
+    df_mt = _fetch_records_df(WS_MAINTENANCE)
+    df_final = _fetch_records_df(WS_FINAL_DB)
+    df_loc = _fetch_records_df(WS_LOCATION)
+
+    branch_map = _machine_branch_map(df_sl, df_mt, df_loc)
+    current = _assemble_current(df_sl, df_mt, _location_rent_df(df_loc), branch_map)
+    legacy = _prep_legacy(df_final)
+
+    master = pd.concat([legacy, current], ignore_index=True, sort=False)
+    if master.empty:
+        return pd.DataFrame(columns=DASH_COLUMNS)
+
+    for c in DASH_NUMERIC:
+        master[c] = pd.to_numeric(master[c], errors="coerce").fillna(0.0) if c in master else 0.0
+    master["Machine_ID"] = _series_str(master, "Machine_ID")
+    master["Branch_Name"] = (_series_str(master, "Branch_Name")
+                             .replace("", "ไม่ระบุสาขา"))
+
+    master = _dedupe_machine_month(master)
+    master["Total_Revenue"] = master["Cash_Revenue"] + master["Transfer_Revenue"]
+    master["Total_Expenses"] = master[
+        ["Rent_Cost", "Water_Cost", "Electric_Cost", "Maintenance_Cost"]
+    ].sum(axis=1)
+    master["Net_Profit"] = master["Total_Revenue"] - master["Total_Expenses"]
+    master["Month_Label"] = master["Month"].dt.strftime("%Y-%m")
+    return master[DASH_COLUMNS].sort_values(["Branch_Name", "Month"]).reset_index(drop=True)
+
+
+# --- Dashboard UI pieces ---------------------------------------------------
+def _dashboard_kpis(view: pd.DataFrame) -> None:
+    revenue = float(view["Total_Revenue"].sum())
+    expenses = float(view["Total_Expenses"].sum())
+    profit = float(view["Net_Profit"].sum())
+    margin = (profit / revenue * 100) if revenue else 0.0
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Revenue · รายรับรวม", f"฿{revenue:,.2f}")
+    c2.metric("Total Expenses · รายจ่ายรวม", f"฿{expenses:,.2f}")
+    c3.metric("Net Profit · กำไรสุทธิ", f"฿{profit:,.2f}", delta=f"{margin:,.1f}% margin")
+
+
+def _dashboard_trend_chart(view: pd.DataFrame) -> None:
+    monthly = view.groupby("Month", as_index=False).agg(
+        Total_Revenue=("Total_Revenue", "sum"),
+        Net_Profit=("Net_Profit", "sum"),
+    )
+    if monthly.empty:
+        return
+    base = alt.Chart(monthly).encode(x=alt.X("Month:T", title="Month"))
+    bar = base.mark_bar(color="#0EA5E9", opacity=0.65, size=26).encode(
+        y=alt.Y("Total_Revenue:Q", title="฿"),
+        tooltip=[alt.Tooltip("Month:T", title="Month"),
+                 alt.Tooltip("Total_Revenue:Q", title="Revenue", format=",.2f")],
+    )
+    line = base.mark_line(color="#0F172A", point=True, strokeWidth=2.5).encode(
+        y=alt.Y("Net_Profit:Q"),
+        tooltip=[alt.Tooltip("Month:T", title="Month"),
+                 alt.Tooltip("Net_Profit:Q", title="Net Profit", format=",.2f")],
+    )
+    st.caption("🟦 Bar = Total Revenue · ⬛ Line = Net Profit")
+    st.altair_chart(
+        alt.layer(bar, line).resolve_scale(y="shared").properties(height=340),
+        use_container_width=True,
+    )
+
+
+def _dashboard_table(view: pd.DataFrame) -> None:
+    table = (view.groupby(["Branch_Name", "Month_Label"], as_index=False)
+                 .agg(Cash=("Cash_Revenue", "sum"),
+                      Transfer=("Transfer_Revenue", "sum"),
+                      Water=("Water_Cost", "sum"),
+                      Elec=("Electric_Cost", "sum"),
+                      Rent=("Rent_Cost", "sum"),
+                      Maintenance=("Maintenance_Cost", "sum"),
+                      Net_Profit=("Net_Profit", "sum"))
+                 .sort_values(["Branch_Name", "Month_Label"]))
+    money = st.column_config.NumberColumn(format="฿%.2f")
+    st.dataframe(
+        table, use_container_width=True, hide_index=True,
+        column_config={c: money for c in
+                       ["Cash", "Transfer", "Water", "Elec", "Rent",
+                        "Maintenance", "Net_Profit"]},
+    )
+
+
+def render_dashboard() -> None:
+    section_header("📊", "Dashboard — ภาพรวมธุรกิจ",
+                   "Revenue, expenses & net profit · filter by branch and month")
+    try:
+        df_master = load_and_prep_dashboard_data()
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Could not build the dashboard: {exc}")
+        return
+    if df_master.empty:
+        st.info("No financial data yet. Add Sales Log / Maintenance entries first.")
+        return
+
+    branches = sorted(b for b in df_master["Branch_Name"].unique() if b)
+    months = sorted(df_master["Month_Label"].unique())
+    with st.container(border=True):
+        f1, f2 = st.columns(2)
+        sel_branches = f1.multiselect("Select Branch (สาขา)", branches, default=branches)
+        sel_months = f2.multiselect("Select Month/Year (เดือน/ปี)", months, default=months)
+
+    view = df_master[
+        df_master["Branch_Name"].isin(sel_branches)
+        & df_master["Month_Label"].isin(sel_months)
+    ]
+    if view.empty:
+        st.warning("No data matches the selected filters.")
+        return
+
+    _dashboard_kpis(view)
+    st.markdown("**📈 Monthly trend · แนวโน้มรายเดือน**")
+    _dashboard_trend_chart(view)
+    st.markdown("**📋 Summary by branch & month · สรุปแยกสาขา/เดือน**")
+    _dashboard_table(view)
+
+
+# ===========================================================================
 # APP ENTRYPOINT
 # ===========================================================================
 def main() -> None:
@@ -1250,7 +1580,8 @@ def main() -> None:
 
         if st.button("🔄 Refresh master data", use_container_width=True):
             fetch_location_data.clear()
-            fetch_raw_email_data.clear()  # also refresh bank-transfer lookups
+            fetch_raw_email_data.clear()        # bank-transfer lookups
+            load_and_prep_dashboard_data.clear()  # dashboard master data
             st.rerun()
 
         st.markdown("---")
@@ -1264,10 +1595,12 @@ def main() -> None:
         st.error(f"Could not load Location master data: {exc}")
         st.stop()
 
-    # --- Feature tabs (Sales Log now handles single AND shared dynamically) --
-    tab_sales, tab_maint = st.tabs(
-        ["📋 Sales Log", "🧾 Maintenance & Expenses"]
+    # --- Feature tabs · Dashboard is the FIRST (default landing) tab --------
+    tab_dash, tab_sales, tab_maint = st.tabs(
+        ["📊 Dashboard", "📝 Sales Log", "🔧 Maintenance & Expenses"]
     )
+    with tab_dash:
+        render_dashboard()
     with tab_sales:
         render_sales_log(location_df)
     with tab_maint:
