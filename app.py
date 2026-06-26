@@ -100,9 +100,23 @@ LOCATION_COLUMNS = [
 PAYMENT_CASH_ONLY = "เงินสดเท่านั้น"      # Cash only -> hide period fields
 PAYMENT_TRANSFER_CASH = "โอน+เงินสด"      # Transfer + cash -> show period fields
 
-# Maintenance defaults.
-ERROR_CODES = ["E7", "A05", "Other"]
-STATUS_PENDING = "รอซ่อม"  # default ticket status
+# Maintenance & Expense ledger codes.
+# The dropdown VALUE stored in the sheet's Error_Code column is the raw code
+# (e.g. "BILL-WATER"); the Thai gloss is display-only (see MAINTENANCE_CODE_LABELS).
+ERROR_CODES = ["E7", "A05", "Other"]                          # technical repairs
+EXPENSE_CODES = ["BILL-WATER", "BILL-ELEC", "MISC-EXPENSE"]   # variable expenses
+MAINTENANCE_CODES = ERROR_CODES + EXPENSE_CODES
+MAINTENANCE_CODE_LABELS = {
+    "E7": "E7",
+    "A05": "A05",
+    "Other": "Other (อื่นๆ)",
+    "BILL-WATER": "BILL-WATER (ค่าน้ำ)",
+    "BILL-ELEC": "BILL-ELEC (ค่าไฟ)",
+    "MISC-EXPENSE": "MISC-EXPENSE (ค่าใช้จ่ายอื่นๆ)",
+}
+
+STATUS_PENDING = "รอซ่อม"          # default status for a technical repair ticket
+STATUS_EXPENSE_PAID = "เคลียร์แล้ว"  # default status for a settled expense entry
 
 # Buddhist Era offset (BE = AD + 543).
 BE_OFFSET = 543
@@ -1265,11 +1279,43 @@ def render_pdf_processor() -> None:
 
 
 # ===========================================================================
-# UI — FEATURE 3: MAINTENANCE FORM  (แจ้งซ่อม)
+# UI — FEATURE 3: MAINTENANCE & EXPENSE LEDGER  (แจ้งซ่อม / บันทึกรายจ่าย)
 # ===========================================================================
+def _is_expense_code(code: str) -> bool:
+    """True for variable-expense codes (utility bills / misc), not technical repairs."""
+    return code in EXPENSE_CODES
+
+
+def build_maintenance_row(
+    *, machine: pd.Series, code: str, desc: str, cost: Any, is_expense: bool
+) -> List[Any]:
+    """
+    Build ONE Maintenance row using the existing 7-column schema:
+    [Report_Date, Machine_ID, Error_Code, Issue_Desc, Repair_Cost,
+     Resolved_Date, Status].
+
+    Repairs default to pending (รอซ่อม) with a blank Resolved_Date; expense
+    entries are settled on entry (เคลียร์แล้ว) so Resolved_Date is stamped today.
+    """
+    report_date = today_iso()
+    if is_expense:
+        status, resolved_date = STATUS_EXPENSE_PAID, report_date
+    else:
+        status, resolved_date = STATUS_PENDING, ""
+    return [
+        report_date,               # Report_Date
+        machine[LOC_MACHINE_ID],   # Machine_ID
+        code,                      # Error_Code (technical code OR expense type)
+        desc.strip(),              # Issue_Desc / Description
+        _to_float(cost),           # Repair_Cost / amount (None -> 0.0)
+        resolved_date,             # Resolved_Date
+        status,                    # Status
+    ]
+
+
 def render_maintenance(location_df: pd.DataFrame) -> None:
-    section_header("🔧", "Maintenance — แจ้งซ่อม",
-                   "Log a repair ticket · default status รอซ่อม")
+    section_header("🧾", "Maintenance & Expenses — แจ้งซ่อม / บันทึกรายจ่าย",
+                   "Repairs + variable expenses (water, electricity, misc)")
 
     if location_df.empty:
         st.warning("No machines found in the Location master sheet.")
@@ -1281,31 +1327,34 @@ def render_maintenance(location_df: pd.DataFrame) -> None:
     with st.form("maintenance_form", clear_on_submit=True):
         top1, top2 = st.columns([2, 1])
         selected_label = top1.selectbox("Select Machine (เลือกตู้)", labels)
-        error_code = top2.selectbox("Error Code", ERROR_CODES)
-        issue_desc = st.text_area("Issue Description (รายละเอียดปัญหา)")
-        repair_cost = st.number_input(
-            "Repair Cost · ค่าซ่อม (฿)", value=None, min_value=0.0, step=1.0,
+        code = top2.selectbox(
+            "Error Code / Expense Type (ประเภทรายจ่าย)", MAINTENANCE_CODES,
+            format_func=lambda c: MAINTENANCE_CODE_LABELS.get(c, c),
+        )
+        desc = st.text_area("Description / บันทึกเพิ่มเติม")
+        cost = st.number_input(
+            "Cost / ยอดเงิน (฿)", value=None, min_value=0.0, step=1.0,
             format="%.2f", placeholder="0.00",
         )
         submitted = st.form_submit_button(
-            "Submit Repair Ticket", type="primary", use_container_width=True
+            "Submit Entry", type="primary", use_container_width=True
         )
 
     if not submitted:
         return
 
-    machine = location_df.iloc[label_to_index[selected_label]]
+    is_expense = _is_expense_code(code)
 
-    # Payload order is contractually fixed.
-    payload = [
-        today_iso(),               # Report_Date
-        machine[LOC_MACHINE_ID],   # Machine_ID
-        error_code,                # Error_Code
-        issue_desc.strip(),        # Issue_Desc
-        _to_float(repair_cost),    # Repair_Cost (None -> 0.0)
-        "",                        # Resolved_Date (blank until resolved)
-        STATUS_PENDING,            # Status -> "รอซ่อม"
-    ]
+    # An expense ledger entry must carry a real amount; a repair may be logged
+    # before its cost is known, so 0 is tolerated there.
+    if is_expense and _to_float(cost) <= 0:
+        st.error("Expense entries require an amount greater than 0 (ยอดเงินต้องมากกว่า 0).")
+        return
+
+    machine = location_df.iloc[label_to_index[selected_label]]
+    payload = build_maintenance_row(
+        machine=machine, code=code, desc=desc, cost=cost, is_expense=is_expense
+    )
 
     try:
         append_row_safe(WS_MAINTENANCE, payload)
@@ -1313,9 +1362,10 @@ def render_maintenance(location_df: pd.DataFrame) -> None:
         st.error(f"Failed to write to Maintenance: {exc}")
         return
 
+    kind = "Expense" if is_expense else "Repair ticket"
     st.success(
-        f"✅ Repair ticket created for {machine[LOC_MACHINE_ID]} "
-        f"(status: {STATUS_PENDING})."
+        f"✅ {kind} saved for {machine[LOC_MACHINE_ID]} · {code} "
+        f"(status: {payload[6]})."
     )
 
 
