@@ -1475,9 +1475,9 @@ def _dashboard_kpis(view: pd.DataFrame) -> None:
     profit = float(view["Net_Profit"].sum())
     margin = (profit / revenue * 100) if revenue else 0.0
     c1, c2, c3 = st.columns(3)
-    c1.metric("Total Revenue · รายรับรวม", f"฿{revenue:,.2f}")
-    c2.metric("Total Expenses · รายจ่ายรวม", f"฿{expenses:,.2f}")
-    c3.metric("Net Profit · กำไรสุทธิ", f"฿{profit:,.2f}", delta=f"{margin:,.1f}% margin")
+    c1.metric("Total Revenue · รายรับรวม", _baht(revenue))
+    c2.metric("Total Expenses · รายจ่ายรวม", _baht(expenses))
+    c3.metric("Net Profit · กำไรสุทธิ", _baht(profit), delta=f"{margin:,.1f}% margin")
 
 
 def _profit_css(value: float) -> str:
@@ -1492,6 +1492,11 @@ def _profit_css(value: float) -> str:
 def _negate_expense(v: float) -> float:
     """Show a cost as a negative deduction (exact zero stays 0.0, not -0.0)."""
     return -abs(v) if abs(v) > 1e-9 else 0.0
+
+
+def _baht(value: float) -> str:
+    """Money as a comma-grouped string with a trailing 'บาท' (e.g. 15,071.12 บาท)."""
+    return f"{value:,.2f} บาท"
 
 
 def _dashboard_trend_chart(view: pd.DataFrame) -> None:
@@ -1510,7 +1515,7 @@ def _dashboard_trend_chart(view: pd.DataFrame) -> None:
 
     base = alt.Chart(monthly).encode(x=x)
     bar = base.mark_bar(color="#0EA5E9", opacity=0.65, size=30).encode(
-        y=alt.Y("Total_Revenue:Q", title="฿"),
+        y=alt.Y("Total_Revenue:Q", title="บาท"),
         tooltip=[alt.Tooltip("Month_Disp:O", title="เดือน"),
                  alt.Tooltip("Total_Revenue:Q", title="รายรับรวม", format=",.2f")],
     )
@@ -1547,7 +1552,7 @@ def _dashboard_monthly_table(view: pd.DataFrame) -> None:
     })
     money_cols = ["รายรับรวม", "รายจ่ายรวม", "กำไรสุทธิ"]
     styler = (monthly.style
-              .format("฿{:,.2f}", subset=money_cols)
+              .format(_baht, subset=money_cols)
               .apply(lambda s: [_profit_css(v) for v in s], subset=["กำไรสุทธิ"]))
     st.dataframe(styler, use_container_width=True, hide_index=True)
 
@@ -1577,9 +1582,9 @@ def _dashboard_table(view: pd.DataFrame) -> None:
     })
     money_cols = ["เงินสด", "เงินโอน", "ค่าน้ำ", "ค่าไฟ", "ค่าเช่า",
                   "ค่าซ่อม/อื่นๆ", "กำไรสุทธิ"]
-    # pandas Styler: commas via format(), green/red Net_Profit via apply().
+    # pandas Styler: 'บาท'-suffixed commas via format(), green/red via apply().
     styler = (table.style
-              .format("฿{:,.2f}", subset=money_cols)
+              .format(_baht, subset=money_cols)
               .apply(lambda s: [_profit_css(v) for v in s], subset=["กำไรสุทธิ"]))
     st.dataframe(styler, use_container_width=True, hide_index=True)
 
