@@ -1527,9 +1527,12 @@ def _baht(value: float) -> str:
 # Self-contained CSS for the iframe-rendered tables (literal hex, no :root vars
 # since the iframe doesn't inherit the page theme).
 _KC_TABLE_CSS = """
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Prompt:wght@400;500;600&display=swap');
   *{ box-sizing:border-box; }
-  body{ margin:0; background:transparent;
-        font-family:'Inter','Prompt',system-ui,-apple-system,sans-serif; color:#0F172A; }
+  body{ margin:0; background:transparent; color:#0F172A;
+        font-family:'Inter','Prompt',system-ui,-apple-system,sans-serif;
+        font-variant-numeric:tabular-nums;
+        -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility; }
   .kc-table{ max-height:460px; overflow:auto; -webkit-overflow-scrolling:touch;
              border:1px solid #E2E8F0; border-radius:14px; background:#fff; }
   .kc-table table{ border-collapse:collapse; width:100%; font-size:.86rem; }
