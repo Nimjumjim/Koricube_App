@@ -1520,6 +1520,17 @@ def _baht(value: float) -> str:
     return f"{value:,.2f} บาท"
 
 
+def _table_width_config(small: tuple = (), medium: tuple = ()) -> dict:
+    """
+    Explicit per-column widths so st.dataframe never truncates the numbers on a
+    narrow phone/tablet screen (the grid scrolls horizontally instead). Works
+    alongside a pandas Styler — Styler handles values/colours, this sets widths.
+    """
+    cfg = {c: st.column_config.Column(width="small") for c in small}
+    cfg.update({c: st.column_config.Column(width="medium") for c in medium})
+    return cfg
+
+
 def _dashboard_trend_chart(view: pd.DataFrame) -> None:
     monthly = (view.groupby(["Month", "Month_Label"], as_index=False)
                    .agg(Total_Revenue=("Total_Revenue", "sum"),
@@ -1575,7 +1586,10 @@ def _dashboard_monthly_table(view: pd.DataFrame) -> None:
     styler = (monthly.style
               .format(_baht, subset=money_cols)
               .apply(lambda s: [_profit_css(v) for v in s], subset=["กำไรสุทธิ"]))
-    st.dataframe(styler, use_container_width=True, hide_index=True)
+    st.dataframe(
+        styler, hide_index=True,
+        column_config=_table_width_config(small=("เดือน",), medium=tuple(money_cols)),
+    )
 
 
 def _dashboard_table(view: pd.DataFrame) -> None:
@@ -1607,7 +1621,11 @@ def _dashboard_table(view: pd.DataFrame) -> None:
     styler = (table.style
               .format(_baht, subset=money_cols)
               .apply(lambda s: [_profit_css(v) for v in s], subset=["กำไรสุทธิ"]))
-    st.dataframe(styler, use_container_width=True, hide_index=True)
+    st.dataframe(
+        styler, hide_index=True,
+        column_config=_table_width_config(
+            small=("เดือน",), medium=("สาขา", *money_cols)),
+    )
 
 
 def _dashboard_branch_chart(view: pd.DataFrame) -> None:
