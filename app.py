@@ -1559,7 +1559,7 @@ def load_pending_transfers() -> pd.DataFrame:
     Trans_Amount / Commission / VAT / Net_Transfer. Empty (well-formed) when
     nothing is pending or the sheets are unreadable.
     """
-    cols = ["Merchant_No", "Merchant_Label", "Month", "Month_Label",
+    cols = ["Merchant_No", "Merchant_Label", "Month", "Month_Label", "Last_Update",
             *PENDING_VALUE_COLS]
     try:
         raw = fetch_raw_email_data()
@@ -1592,10 +1592,16 @@ def load_pending_transfers() -> pd.DataFrame:
     if pending.empty:
         return pd.DataFrame(columns=cols)
 
-    agg = (pending.groupby(["Merchant_No", "Month"], as_index=False)[PENDING_VALUE_COLS]
-                  .sum())
+    agg = pending.groupby(["Merchant_No", "Month"], as_index=False).agg(
+        Trans_Amount=("Trans_Amount", "sum"),
+        Commission=("Commission", "sum"),
+        VAT=("VAT", "sum"),
+        Net_Transfer=("Net_Transfer", "sum"),
+        _last=("_date", "max"),  # most recent Transfer_Date in this bucket
+    )
     agg["Merchant_Label"] = agg["Merchant_No"].map(label_map).fillna("")
     agg["Month_Label"] = agg["Month"].dt.strftime("%Y-%m")
+    agg["Last_Update"] = agg["_last"].dt.strftime("%Y-%m-%d")
     return agg[cols].sort_values(["Merchant_Label", "Month"]).reset_index(drop=True)
 
 
@@ -1894,14 +1900,17 @@ def render_bank_transfers() -> None:
 
     # Flat detail: one row per (Merchant, Month) showing EVERY amount column,
     # plus a grand-total row at the bottom.
-    table = (view[["Merchant_Label", "Merchant_No", "Month_Label", *PENDING_VALUE_COLS]]
+    table = (view[["Merchant_Label", "Merchant_No", "Month_Label", "Last_Update",
+                   *PENDING_VALUE_COLS]]
              .sort_values(["Merchant_Label", "Month_Label"]).reset_index(drop=True))
-    total = {"Merchant_Label": "รวมทั้งหมด", "Merchant_No": "", "Month_Label": ""}
+    total = {"Merchant_Label": "รวมทั้งหมด", "Merchant_No": "", "Month_Label": "",
+             "Last_Update": table["Last_Update"].max()}  # overall latest transfer
     total.update({c: table[c].sum() for c in PENDING_VALUE_COLS})
     table = pd.concat([table, pd.DataFrame([total])], ignore_index=True)
 
     table = table.rename(columns={
         "Merchant_Label": "สาขา", "Merchant_No": "Merchant No", "Month_Label": "เดือน",
+        "Last_Update": "อัพเดตล่าสุด",
         "Trans_Amount": "ยอดโอนรวม", "Commission": "ค่าธรรมเนียม", "VAT": "VAT",
         "Net_Transfer": "ยอดเข้าจริง",
     })
