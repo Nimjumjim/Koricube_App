@@ -1310,12 +1310,12 @@ def _series_raw(df: pd.DataFrame, *names: str) -> pd.Series:
     return pd.Series([None] * len(df), index=df.index, dtype=object)
 
 
-def _to_month_start(values: pd.Series) -> pd.Series:
+def _to_datetime(values: pd.Series) -> pd.Series:
     """
-    Normalise a date-ish column to the first day of its month (Timestamp).
+    Parse a date-ish column to day-level Timestamps (NaT for blanks/garbage).
 
     Handles three shapes robustly: ISO/locale strings (incl. Buddhist Era),
-    Google-Sheets serial numbers (UNFORMATTED dates), and blanks -> NaT.
+    Google-Sheets serial numbers (UNFORMATTED dates), and blanks.
     """
     epoch = pd.Timestamp("1899-12-30")  # Google Sheets day 0
 
@@ -1326,8 +1326,12 @@ def _to_month_start(values: pd.Series) -> pd.Series:
             return epoch + pd.to_timedelta(int(v), unit="D") if 1 <= v <= 80000 else pd.NaT
         return pd.to_datetime(normalize_date_string(v), errors="coerce")
 
-    parsed = pd.to_datetime(values.map(parse), errors="coerce")
-    return parsed.dt.to_period("M").dt.to_timestamp()
+    return pd.to_datetime(values.map(parse), errors="coerce")
+
+
+def _to_month_start(values: pd.Series) -> pd.Series:
+    """Day-level parse (see ``_to_datetime``) floored to the first of the month."""
+    return _to_datetime(values).dt.to_period("M").dt.to_timestamp()
 
 
 def _machine_branch_map(*frames: pd.DataFrame) -> dict:
@@ -1493,6 +1497,114 @@ def load_and_prep_dashboard_data() -> pd.DataFrame:
     return master[DASH_COLUMNS].sort_values(["Branch_Name", "Month"]).reset_index(drop=True)
 
 
+# ===========================================================================
+# BANK TRANSFERS — Raw_Email settlements NOT yet reconciled in Sales_Log
+# ===========================================================================
+PENDING_METRICS = {  # selectbox label -> Raw_Email column summed in the pivot
+    "Net_Transfer (ยอดเข้าจริง)": "Net_Transfer",
+    "Trans_Amount (ยอดโอนรวม)": "Trans_Amount",
+    "Commission (ค่าธรรมเนียม)": "Commission",
+}
+PENDING_VALUE_COLS = ["Trans_Amount", "Commission", "VAT", "Net_Transfer"]
+
+
+def _merchant_branch_map(location_df: pd.DataFrame) -> dict:
+    """
+    Merchant_No (digits) -> readable label of its branch(es). A shared merchant
+    that maps to two branches is joined with ' + ' (e.g. 'ป.พัน7 + เจ็ดยอด3'); the
+    raw Merchant_No is appended for traceability.
+    """
+    if location_df is None or location_df.empty:
+        return {}
+    by_merchant: dict = {}
+    for raw_m, branch in zip(_series_str(location_df, LOC_MERCHANT_NO),
+                             _series_str(location_df, LOC_BRANCH, "Branch_Name")):
+        merchant = _digits_only(raw_m)
+        if not merchant:
+            continue
+        names = by_merchant.setdefault(merchant, [])
+        if branch and branch not in names:
+            names.append(branch)
+    return {m: (f"{' + '.join(sorted(names))} · {m}" if names else m)
+            for m, names in by_merchant.items()}
+
+
+def _sales_log_periods(df_sl: pd.DataFrame) -> dict:
+    """
+    {merchant_digits: [(start_ts, end_ts), ...]} for every Sales_Log entry that
+    carries a merchant + both period dates — i.e. the windows already reconciled.
+    """
+    periods: dict = {}
+    if df_sl is None or df_sl.empty:
+        return periods
+    starts = _to_datetime(_series_raw(df_sl, "Period_Start"))
+    ends = _to_datetime(_series_raw(df_sl, "Period_End"))
+    merchants = _series_str(df_sl, "Merchant_No")
+    for raw_m, start, end in zip(merchants, starts, ends):
+        merchant = _digits_only(raw_m)
+        if merchant and not pd.isna(start) and not pd.isna(end):
+            periods.setdefault(merchant, []).append((start, end))
+    return periods
+
+
+def _is_reconciled(merchant: str, when, periods: dict) -> bool:
+    """True if ``when`` (a Timestamp) falls within any reconciled period."""
+    if pd.isna(when):
+        return False
+    return any(start <= when <= end for start, end in periods.get(merchant, []))
+
+
+@st.cache_data(ttl=120, show_spinner="Loading pending bank transfers…")
+def load_pending_transfers() -> pd.DataFrame:
+    """
+    Raw_Email rows NOT yet reconciled in Sales_Log, aggregated per
+    (Merchant, Month). A row is reconciled when its Transfer_Date sits inside a
+    Sales_Log [Period_Start, Period_End] for the same merchant.
+
+    Columns: Merchant_No, Merchant_Label, Month, Month_Label + summed
+    Trans_Amount / Commission / VAT / Net_Transfer. Empty (well-formed) when
+    nothing is pending or the sheets are unreadable.
+    """
+    cols = ["Merchant_No", "Merchant_Label", "Month", "Month_Label",
+            *PENDING_VALUE_COLS]
+    try:
+        raw = fetch_raw_email_data()
+    except Exception:  # noqa: BLE001
+        return pd.DataFrame(columns=cols)
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=cols)
+
+    df_sl = _fetch_records_df(WS_SALES_LOG)
+    df_loc = _fetch_records_df(WS_LOCATION)
+    periods = _sales_log_periods(df_sl)
+    label_map = _merchant_branch_map(df_loc)
+
+    tidy = pd.DataFrame({
+        "Merchant_No": raw["Merchant_No"].apply(_digits_only),
+        "_date": _to_datetime(_series_raw(raw, "Transfer_Date")),
+        "Month": _to_month_start(_series_raw(raw, "Transfer_Date")),
+        "Trans_Amount": _series_num(raw, "Trans_Amount"),
+        "Commission": _series_num(raw, "Commission"),
+        "VAT": _series_num(raw, "VAT"),
+        "Net_Transfer": _series_num(raw, "Net_Transfer"),
+    }).dropna(subset=["Month"])
+    tidy = tidy[tidy["Merchant_No"] != ""]
+    if tidy.empty:
+        return pd.DataFrame(columns=cols)
+
+    pending_mask = ~tidy.apply(
+        lambda r: _is_reconciled(r["Merchant_No"], r["_date"], periods), axis=1)
+    pending = tidy[pending_mask]
+    if pending.empty:
+        return pd.DataFrame(columns=cols)
+
+    agg = (pending.groupby(["Merchant_No", "Month"], as_index=False)[PENDING_VALUE_COLS]
+                  .sum())
+    agg["Merchant_Label"] = agg["Merchant_No"].map(label_map).fillna(agg["Merchant_No"])
+    agg["Month_Label"] = agg["Month"].dt.strftime("%Y-%m")
+    return agg[cols].sort_values(["Merchant_Label", "Month"]).reset_index(drop=True)
+
+
 # --- Dashboard UI pieces ---------------------------------------------------
 def _dashboard_kpis(view: pd.DataFrame) -> None:
     revenue = float(view["Total_Revenue"].sum())
@@ -1562,6 +1674,12 @@ _KC_TABLE_CSS = """
   .kc-freeze2 tbody td:nth-child(1), .kc-freeze2 tbody td:nth-child(2){
        background:#fff; z-index:1; }
   .kc-freeze2 thead th:nth-child(1), .kc-freeze2 thead th:nth-child(2){ z-index:3; }
+  /* Freeze only the first column (e.g. a wide merchant label). */
+  .kc-freeze1 th:nth-child(1), .kc-freeze1 td:nth-child(1){
+       position:sticky; left:0; width:170px; min-width:170px; max-width:170px;
+       overflow:hidden; text-overflow:ellipsis; box-shadow:2px 0 0 0 #E2E8F0; }
+  .kc-freeze1 tbody td:nth-child(1){ background:#fff; z-index:1; }
+  .kc-freeze1 thead th:nth-child(1){ z-index:3; }
 """
 
 
@@ -1759,6 +1877,49 @@ def render_dashboard() -> None:
 
 
 # ===========================================================================
+# UI — BANK TRANSFERS (Raw_Email pending reconciliation)
+# ===========================================================================
+def render_bank_transfers() -> None:
+    section_header("🏦", "ยอดโอนธนาคาร — ยังไม่ได้กระทบยอด",
+                   "Raw_Email settlements with no matching Sales_Log period yet")
+    try:
+        pending = load_pending_transfers()
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Could not load bank transfers: {exc}")
+        return
+    if pending.empty:
+        st.success("ทุกเดือนกระทบยอดครบแล้ว 🎉 (ไม่มียอดโอนค้างใน Raw_Email)")
+        return
+
+    months = sorted(pending["Month_Label"].unique())
+    with st.container(border=True):
+        f1, f2 = st.columns([1, 1])
+        metric_label = f1.selectbox("ค่าที่แสดง", list(PENDING_METRICS.keys()), index=0)
+        sel_months = f2.multiselect("เดือน/ปี", months, default=months)
+    metric_col = PENDING_METRICS[metric_label]
+
+    view = pending[pending["Month_Label"].isin(sel_months)]
+    if view.empty:
+        st.warning("ไม่มีข้อมูลตามตัวกรองที่เลือก")
+        return
+
+    # Pivot: Merchant rows × Month columns, with a row-wise total.
+    pivot = (view.pivot_table(index="Merchant_Label", columns="Month_Label",
+                              values=metric_col, aggfunc="sum")
+                 .reindex(columns=sorted(view["Month_Label"].unique()))
+                 .fillna(0.0))
+    pivot["รวม"] = pivot.sum(axis=1)
+    pivot = pivot.sort_values("รวม", ascending=False).reset_index()
+    pivot = pivot.rename(columns={"Merchant_Label": "Merchant (สาขา)"})
+
+    money_cols = [c for c in pivot.columns if c != "Merchant (สาขา)"]
+    styler = pivot.style.format(_comma, subset=money_cols)
+    st.markdown(f"**📋 ยอดค้างกระทบยอด · {metric_label} (หน่วย: บาท)**")
+    _render_styled_table(styler, freeze=1)
+    st.caption("แสดงเฉพาะเดือน × Merchant ที่ยังไม่มีรอบบิลใน Sales_Log ครอบคลุม")
+
+
+# ===========================================================================
 # APP ENTRYPOINT
 # ===========================================================================
 def main() -> None:
@@ -1782,6 +1943,7 @@ def main() -> None:
             fetch_location_data.clear()
             fetch_raw_email_data.clear()        # bank-transfer lookups
             load_and_prep_dashboard_data.clear()  # dashboard master data
+            load_pending_transfers.clear()        # pending-transfers tab
             st.rerun()
 
         st.markdown("---")
@@ -1796,11 +1958,13 @@ def main() -> None:
         st.stop()
 
     # --- Feature tabs · Dashboard is the FIRST (default landing) tab --------
-    tab_dash, tab_sales, tab_maint = st.tabs(
-        ["📊 Dashboard", "📝 Sales Log", "🔧 Maintenance & Expenses"]
+    tab_dash, tab_bank, tab_sales, tab_maint = st.tabs(
+        ["📊 Dashboard", "🏦 ยอดโอนธนาคาร", "📝 Sales Log", "🔧 Maintenance & Expenses"]
     )
     with tab_dash:
         render_dashboard()
+    with tab_bank:
+        render_bank_transfers()
     with tab_sales:
         render_sales_log(location_df)
     with tab_maint:
