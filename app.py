@@ -1524,6 +1524,11 @@ def _baht(value: float) -> str:
     return f"{value:,.2f} บาท"
 
 
+def _comma(value: float) -> str:
+    """Comma-grouped 2-dp number, NO currency suffix (unit lives in the header)."""
+    return f"{value:,.2f}"
+
+
 # Self-contained CSS for the iframe-rendered tables (literal hex, no :root vars
 # since the iframe doesn't inherit the page theme).
 _KC_TABLE_CSS = """
@@ -1639,7 +1644,7 @@ def _dashboard_monthly_table(view: pd.DataFrame) -> None:
     })
     money_cols = ["รายรับรวม", "รายจ่ายรวม", "กำไรสุทธิ"]
     styler = (monthly.style
-              .format(_baht, subset=money_cols)
+              .format(_comma, subset=money_cols)
               .apply(lambda s: [_profit_css(v) for v in s], subset=["กำไรสุทธิ"]))
     _render_styled_table(styler)
 
@@ -1671,7 +1676,7 @@ def _dashboard_table(view: pd.DataFrame) -> None:
                   "ค่าซ่อม/อื่นๆ", "กำไรสุทธิ"]
     # pandas Styler: 'บาท'-suffixed commas via format(), green/red via apply().
     styler = (table.style
-              .format(_baht, subset=money_cols)
+              .format(_comma, subset=money_cols)
               .apply(lambda s: [_profit_css(v) for v in s], subset=["กำไรสุทธิ"]))
     # Freeze สาขา + เดือน so they stay put while the money columns scroll.
     _render_styled_table(styler, freeze=2)
@@ -1745,9 +1750,9 @@ def render_dashboard() -> None:
     _dashboard_kpis(view)
     st.markdown("**📈 Monthly trend · แนวโน้มรายเดือน**")
     _dashboard_trend_chart(view)
-    st.markdown("**🗓️ สรุปรายเดือน (รวมทุกสาขา)**")
+    st.markdown("**🗓️ สรุปรายเดือน (รวมทุกสาขา · หน่วย: บาท)**")
     _dashboard_monthly_table(view)
-    st.markdown("**📋 สรุปแยกสาขา/เดือน**")
+    st.markdown("**📋 สรุปแยกสาขา/เดือน (หน่วย: บาท)**")
     _dashboard_table(view)
     st.markdown("**🏢 เปรียบเทียบสาขา · รายเดือน**")
     _dashboard_branch_chart(view)
