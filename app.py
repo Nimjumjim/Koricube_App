@@ -1500,11 +1500,6 @@ def load_and_prep_dashboard_data() -> pd.DataFrame:
 # ===========================================================================
 # BANK TRANSFERS — Raw_Email settlements NOT yet reconciled in Sales_Log
 # ===========================================================================
-PENDING_METRICS = {  # selectbox label -> Raw_Email column summed in the pivot
-    "Net_Transfer (ยอดเข้าจริง)": "Net_Transfer",
-    "Trans_Amount (ยอดโอนรวม)": "Trans_Amount",
-    "Commission (ค่าธรรมเนียม)": "Commission",
-}
 PENDING_VALUE_COLS = ["Trans_Amount", "Commission", "VAT", "Net_Transfer"]
 
 
@@ -1525,8 +1520,7 @@ def _merchant_branch_map(location_df: pd.DataFrame) -> dict:
         names = by_merchant.setdefault(merchant, [])
         if branch and branch not in names:
             names.append(branch)
-    return {m: (f"{' + '.join(sorted(names))} · {m}" if names else m)
-            for m, names in by_merchant.items()}
+    return {m: " + ".join(sorted(names)) for m, names in by_merchant.items()}
 
 
 def _sales_log_periods(df_sl: pd.DataFrame) -> dict:
@@ -1600,7 +1594,7 @@ def load_pending_transfers() -> pd.DataFrame:
 
     agg = (pending.groupby(["Merchant_No", "Month"], as_index=False)[PENDING_VALUE_COLS]
                   .sum())
-    agg["Merchant_Label"] = agg["Merchant_No"].map(label_map).fillna(agg["Merchant_No"])
+    agg["Merchant_Label"] = agg["Merchant_No"].map(label_map).fillna("")
     agg["Month_Label"] = agg["Month"].dt.strftime("%Y-%m")
     return agg[cols].sort_values(["Merchant_Label", "Month"]).reset_index(drop=True)
 
@@ -1892,29 +1886,28 @@ def render_bank_transfers() -> None:
         return
 
     months = sorted(pending["Month_Label"].unique())
-    with st.container(border=True):
-        f1, f2 = st.columns([1, 1])
-        metric_label = f1.selectbox("ค่าที่แสดง", list(PENDING_METRICS.keys()), index=0)
-        sel_months = f2.multiselect("เดือน/ปี", months, default=months)
-    metric_col = PENDING_METRICS[metric_label]
-
+    sel_months = st.multiselect("เดือน/ปี", months, default=months)
     view = pending[pending["Month_Label"].isin(sel_months)]
     if view.empty:
         st.warning("ไม่มีข้อมูลตามตัวกรองที่เลือก")
         return
 
-    # Pivot: Merchant rows × Month columns, with a row-wise total.
-    pivot = (view.pivot_table(index="Merchant_Label", columns="Month_Label",
-                              values=metric_col, aggfunc="sum")
-                 .reindex(columns=sorted(view["Month_Label"].unique()))
-                 .fillna(0.0))
-    pivot["รวม"] = pivot.sum(axis=1)
-    pivot = pivot.sort_values("รวม", ascending=False).reset_index()
-    pivot = pivot.rename(columns={"Merchant_Label": "Merchant (สาขา)"})
+    # Flat detail: one row per (Merchant, Month) showing EVERY amount column,
+    # plus a grand-total row at the bottom.
+    table = (view[["Merchant_Label", "Merchant_No", "Month_Label", *PENDING_VALUE_COLS]]
+             .sort_values(["Merchant_Label", "Month_Label"]).reset_index(drop=True))
+    total = {"Merchant_Label": "รวมทั้งหมด", "Merchant_No": "", "Month_Label": ""}
+    total.update({c: table[c].sum() for c in PENDING_VALUE_COLS})
+    table = pd.concat([table, pd.DataFrame([total])], ignore_index=True)
 
-    money_cols = [c for c in pivot.columns if c != "Merchant (สาขา)"]
-    styler = pivot.style.format(_comma, subset=money_cols)
-    st.markdown(f"**📋 ยอดค้างกระทบยอด · {metric_label} (หน่วย: บาท)**")
+    table = table.rename(columns={
+        "Merchant_Label": "สาขา", "Merchant_No": "Merchant No", "Month_Label": "เดือน",
+        "Trans_Amount": "ยอดโอนรวม", "Commission": "ค่าธรรมเนียม", "VAT": "VAT",
+        "Net_Transfer": "ยอดเข้าจริง",
+    })
+    money_cols = ["ยอดโอนรวม", "ค่าธรรมเนียม", "VAT", "ยอดเข้าจริง"]
+    styler = table.style.format(_comma, subset=money_cols)
+    st.markdown("**📋 ยอดค้างกระทบยอด · ทุกค่า (หน่วย: บาท)**")
     _render_styled_table(styler, freeze=1)
     st.caption("แสดงเฉพาะเดือน × Merchant ที่ยังไม่มีรอบบิลใน Sales_Log ครอบคลุม")
 
