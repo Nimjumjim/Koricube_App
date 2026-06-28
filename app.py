@@ -731,7 +731,7 @@ def inject_css() -> None:
             background:#f7f8fc; color:var(--kc-muted); font-weight:600;
             padding:9px 14px; text-align:right; white-space:nowrap;
             border-bottom:1px solid var(--kc-border);
-            position:sticky; top:0; z-index:1;
+            position:sticky; top:0; z-index:2;
         }
         .kc-table tbody td{
             padding:8px 14px; text-align:right; white-space:nowrap;
@@ -739,6 +739,25 @@ def inject_css() -> None:
         }
         .kc-table th:first-child, .kc-table td:first-child{ text-align:left; }
         .kc-table tbody tr:last-child td{ border-bottom:none; }
+
+        /* Freeze first two columns (สาขา + เดือน) on horizontal scroll so you
+           always see which branch/month a row belongs to on a phone. */
+        .kc-freeze2 th:nth-child(1), .kc-freeze2 td:nth-child(1){
+            position:sticky; left:0;
+            width:118px; min-width:118px; max-width:118px;
+            overflow:hidden; text-overflow:ellipsis;
+        }
+        .kc-freeze2 th:nth-child(2), .kc-freeze2 td:nth-child(2){
+            position:sticky; left:118px;
+            width:82px; min-width:82px; max-width:82px;
+            box-shadow:2px 0 0 0 var(--kc-border);
+        }
+        .kc-freeze2 tbody td:nth-child(1), .kc-freeze2 tbody td:nth-child(2){
+            background:var(--kc-card); z-index:1;
+        }
+        .kc-freeze2 thead th:nth-child(1), .kc-freeze2 thead th:nth-child(2){
+            z-index:3;
+        }
 
         /* ---- Mobile ---- */
         @media (max-width:640px){
@@ -1544,16 +1563,20 @@ def _baht(value: float) -> str:
     return f"{value:,.2f} บาท"
 
 
-def _render_styled_table(styler) -> None:
+def _render_styled_table(styler, freeze: int = 0) -> None:
     """
     Render a pandas Styler as a real HTML table (not st.dataframe's canvas grid).
 
     width:100% fills the desktop container with NO horizontal scroll; on a narrow
     phone the no-wrap cells make the wrapper scroll instead of truncating the
     numbers. Keeps the Styler's commas / 'บาท' / green-red colours intact.
+
+    ``freeze=2`` pins the first two columns (e.g. branch + month) so they stay
+    visible while the rest scrolls horizontally on a phone.
     """
     html = styler.hide(axis="index").to_html()
-    st.markdown(f'<div class="kc-table">{html}</div>', unsafe_allow_html=True)
+    css_class = "kc-table" + (f" kc-freeze{freeze}" if freeze else "")
+    st.markdown(f'<div class="{css_class}">{html}</div>', unsafe_allow_html=True)
 
 
 def _dashboard_trend_chart(view: pd.DataFrame) -> None:
@@ -1643,7 +1666,8 @@ def _dashboard_table(view: pd.DataFrame) -> None:
     styler = (table.style
               .format(_baht, subset=money_cols)
               .apply(lambda s: [_profit_css(v) for v in s], subset=["กำไรสุทธิ"]))
-    _render_styled_table(styler)
+    # Freeze สาขา + เดือน so they stay put while the money columns scroll.
+    _render_styled_table(styler, freeze=2)
 
 
 def _dashboard_branch_chart(view: pd.DataFrame) -> None:
