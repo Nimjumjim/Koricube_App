@@ -716,6 +716,30 @@ def inject_css() -> None:
         .stTabs [data-baseweb="tab"]{ font-weight:600; color:var(--kc-muted); }
         .stTabs [aria-selected="true"]{ color:var(--kc-accent-strong); }
 
+        /* ---- HTML dashboard tables ----
+           width:100% fits & fills the desktop container (no horizontal scroll);
+           white-space:nowrap keeps numbers intact, so on a narrow phone the
+           wrapper scrolls instead of truncating. Sticky header + max-height
+           keeps tall tables compact. */
+        .kc-table{
+            max-height:460px; overflow:auto; -webkit-overflow-scrolling:touch;
+            border:1px solid var(--kc-border); border-radius:14px;
+            box-shadow:var(--kc-shadow); background:var(--kc-card);
+        }
+        .kc-table table{ border-collapse:collapse; width:100%; font-size:.86rem; }
+        .kc-table thead th{
+            background:#f7f8fc; color:var(--kc-muted); font-weight:600;
+            padding:9px 14px; text-align:right; white-space:nowrap;
+            border-bottom:1px solid var(--kc-border);
+            position:sticky; top:0; z-index:1;
+        }
+        .kc-table tbody td{
+            padding:8px 14px; text-align:right; white-space:nowrap;
+            border-bottom:1px solid var(--kc-border); color:var(--kc-ink);
+        }
+        .kc-table th:first-child, .kc-table td:first-child{ text-align:left; }
+        .kc-table tbody tr:last-child td{ border-bottom:none; }
+
         /* ---- Mobile ---- */
         @media (max-width:640px){
             .kc-topbar .clock{ display:none; }
@@ -1520,15 +1544,16 @@ def _baht(value: float) -> str:
     return f"{value:,.2f} บาท"
 
 
-def _table_width_config(small: tuple = (), medium: tuple = ()) -> dict:
+def _render_styled_table(styler) -> None:
     """
-    Explicit per-column widths so st.dataframe never truncates the numbers on a
-    narrow phone/tablet screen (the grid scrolls horizontally instead). Works
-    alongside a pandas Styler — Styler handles values/colours, this sets widths.
+    Render a pandas Styler as a real HTML table (not st.dataframe's canvas grid).
+
+    width:100% fills the desktop container with NO horizontal scroll; on a narrow
+    phone the no-wrap cells make the wrapper scroll instead of truncating the
+    numbers. Keeps the Styler's commas / 'บาท' / green-red colours intact.
     """
-    cfg = {c: st.column_config.Column(width="small") for c in small}
-    cfg.update({c: st.column_config.Column(width="medium") for c in medium})
-    return cfg
+    html = styler.hide(axis="index").to_html()
+    st.markdown(f'<div class="kc-table">{html}</div>', unsafe_allow_html=True)
 
 
 def _dashboard_trend_chart(view: pd.DataFrame) -> None:
@@ -1586,10 +1611,7 @@ def _dashboard_monthly_table(view: pd.DataFrame) -> None:
     styler = (monthly.style
               .format(_baht, subset=money_cols)
               .apply(lambda s: [_profit_css(v) for v in s], subset=["กำไรสุทธิ"]))
-    st.dataframe(
-        styler, hide_index=True,
-        column_config=_table_width_config(small=("เดือน",), medium=tuple(money_cols)),
-    )
+    _render_styled_table(styler)
 
 
 def _dashboard_table(view: pd.DataFrame) -> None:
@@ -1621,11 +1643,7 @@ def _dashboard_table(view: pd.DataFrame) -> None:
     styler = (table.style
               .format(_baht, subset=money_cols)
               .apply(lambda s: [_profit_css(v) for v in s], subset=["กำไรสุทธิ"]))
-    st.dataframe(
-        styler, hide_index=True,
-        column_config=_table_width_config(
-            small=("เดือน",), medium=("สาขา", *money_cols)),
-    )
+    _render_styled_table(styler)
 
 
 def _dashboard_branch_chart(view: pd.DataFrame) -> None:
